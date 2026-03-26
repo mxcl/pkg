@@ -1,0 +1,6 @@
+[
+  // Formulae with supported post_install hooks.
+  "ca-certificates", // does super complex rebuild of the certs which we should probs do lol
+  "openssl@3",
+  "glib" // creates directory that we have due to consolidation
+]
