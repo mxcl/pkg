@@ -1,0 +1,4 @@
+/target
+/cache
+/pkg-*.tar.gz
+/data/db.json
