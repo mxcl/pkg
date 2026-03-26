@@ -123,7 +123,6 @@ struct FormulaInfo {
     dependencies: Vec<String>,
     bottle: Bottle,
     disabled: bool,
-    service: Option<serde_json::Value>,
     #[serde(default)]
     post_install_defined: bool,
 }
@@ -2773,9 +2772,6 @@ fn formula_has_unsupported_install_hooks(
     info: &FormulaInfo,
     allow_supported_post_install: bool,
 ) -> bool {
-    if info.service.is_some() {
-        return true;
-    }
     if info.post_install_defined
         && !embedded_post_install_check_skip().contains(formula)
         && !(allow_supported_post_install && post_install_hooks::supports(formula))
@@ -4193,7 +4189,6 @@ mod tests {
                 }),
             },
             disabled: false,
-            service: None,
             post_install_defined,
         }
     }
@@ -5034,6 +5029,29 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             &info,
             false,
         ));
+    }
+
+    #[test]
+    fn unsupported_install_hooks_allow_service_formulae() {
+        let info: FormulaInfo = serde_json::from_value(serde_json::json!({
+            "versions": {
+                "stable": "1.0.0"
+            },
+            "revision": 0,
+            "dependencies": [],
+            "bottle": {
+                "stable": {
+                    "files": {}
+                }
+            },
+            "disabled": false,
+            "service": {
+                "run": ["bin/exampled"]
+            },
+            "post_install_defined": false
+        }))
+        .unwrap();
+        assert!(!formula_has_unsupported_install_hooks("example", &info, false));
     }
 
     #[test]

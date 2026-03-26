@@ -66,11 +66,12 @@ days. Homebrew is 16 years old.
   - notably `npx` does not behave this way and requires eg. `npx foo@latest`
     but we do not have the same scope—all our packages are ephemeral
 - Homebrew formula with:
-  - `services` are not supported via `pkg install`
   - `post_install` steps are not supported via `pkg install` or `pkg use`
   - `pre_install` steps are not supported via `pkg install` or `pkg use`
   We may figure out how to support these. But for now we’re just not going to
   do this because we assume we will screw it up.
+  - `service` metadata does not block install, but `pkg` does not manage
+    those services for you
 
 ### Caveats Relative to Brew Specifically
 
@@ -102,4 +103,4 @@ days. Homebrew is 16 years old.
   - Indeed this may prove stupid and/or flakey
   - Indeed we do not recommend you depend on `pkg` in any substantial way
 - We are overzealously rejecting any Homebrew packages with pre or post
-  install steps and services at this time.
+  install steps at this time.

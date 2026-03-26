@@ -40,7 +40,8 @@ the code alone.
 - When `openssl@3` is present, post-install moves
   `share/ca-certificates/` to `ssl/` and renames `cacert.pem` to
   `cert.pem` to keep rewritten binary paths short enough.
-- Homebrew formulas with `service` metadata are unsupported.
+- Homebrew formulas with `service` metadata are installable, but `pkg`
+  does not manage those services.
 - Homebrew formulas with `post_install` are unsupported except:
   `openssl@3`, `ca-certificates`, and `python@<major>.<minor>` during
   `i` installs.
