@@ -1,6 +1,6 @@
 # `pkg`
 
-Execution, performance and security focused package manager.
+Execution, performance and security focused package manager for macOS.
 
 ## Install
 
@@ -19,14 +19,16 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/pkg | sudo tar -xzC /usr/local/b
 
 ## Overview
 
-- Installs to `/opt`
+- Installs as root (like the good ol’ days)
+- Installs to `/opt/$PKGNAME`
 - Installs from vendor when possible
 - Installs Homebrew packages otherwise
 - Never touches `/opt/homebrew`
-- Dependencies of Homebrew packages are installed alongside, ie. a self contained sandbox
+- Dependencies of Homebrew packages are installed alongside, ie. a self
+  contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
 - `pkg use PKG` can run anything ephemerally (downloads fresh every time)
-- Agent focused: we package openclaw, clawhub and qmd
+- Agent focused, eg. we package openclaw, clawhub and `qmd`
 
 ## Usage
 
@@ -34,16 +36,16 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/pkg | sudo tar -xzC /usr/local/b
 $ pkg use zopflipng in.png out.png
 
 $ sudo pkg install openclaw
-/usr/local/bin/openclaw -> /opt/openclaw/bin/openclaw
-# we shouldn’t let OpenClaw modify itself!
+/usr/local/bin/openclaw
+# Humans don’t let Claws modify themselves
 
 $ sudo pkg uninstall openclaw  # alias: rm
+
+$ pkg list  # alias: ls
 
 $ pkg outdated
 
 $ sudo pkg update
-
-$ sudo pkg list  # alias: ls
 ```
 
 ## Is This Ready For Me?
@@ -51,15 +53,20 @@ $ sudo pkg list  # alias: ls
 No. Do not use this as a replacement for Homebrew. I whipped it up in a few
 days. Homebrew is 16 years old.
 
+## But I Wanna!
+
+That’s fine. I like it. I think it's good. Maybe you will too.
+
 ## Caveats
 
 - Mostly we are not going to package things from eg. `npm`, so you will need
-  to `pkg use npx` or `pkg install npm && npm install -g` yourself.
+  to `pkg use npx`.
+  > [!NOTE]
+  > Having said this; We recommend that you not `npm install -g` anything:
+  > `npm` is not a package manager: it’s a dependency manager.
 - We make exceptions arbitarily
   - eg. OpenClaw is a special case because we do not think it’s a great idea
-    to let OpenClaw modify itself and `npm` is not a package manager: it’s
-    a *dependency manager*. In general you should not globally install with
-    `npm` (in our humble opinion) and instead always `npx`.
+    to let OpenClaw modify.
 - `pkg use` always does an update check unless you run with a specific
   version, eg. `pkg use zopflipng@1.0.3 …`
   - notably `npx` does not behave this way and requires eg. `npx foo@latest`
@@ -69,8 +76,8 @@ days. Homebrew is 16 years old.
   - `pre_install` steps are not supported via `pkg install` or `pkg use`
   We may figure out how to support these. But for now we’re just not going to
   do this because we assume we will screw it up.
-  - `service` metadata does not block install, but `pkg` does not manage
-    those services for you. The service plist is in `/opt/foo` if you want.
+- `service` metadata does not block installs, but `pkg` does not manage
+  those services for you. The service plist is in `/opt/foo` if you want.
 
 ### Caveats Relative to Brew Specifically
 
