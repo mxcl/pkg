@@ -207,11 +207,11 @@ for target in "${targets[@]}"; do
   rustup target add "$target"
 
   if [ "$target" = "aarch64-apple-darwin" ] && [ "$(uname -s)" = "Darwin" ]; then
-    cargo build --release --target "$target"
+    cargo build --release --features self-update --target "$target"
   elif [ "$target" = "x86_64-apple-darwin" ] && [ "$(uname -s)" = "Darwin" ]; then
-    cargo build --release --target "$target"
+    cargo build --release --features self-update --target "$target"
   else
-    cargo zigbuild --release --target "$target"
+    cargo zigbuild --release --features self-update --target "$target"
   fi
 
   bin_path="target/$target/release/$bin_file"

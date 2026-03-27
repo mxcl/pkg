@@ -94,6 +94,11 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
 const TMP_X_ROOT: &str = "/tmp/x";
 const OPT_PKG_ROOT: &str = "/opt";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
+#[cfg(feature = "self-update")]
+const SELF_UPDATE_TARGET: &str = "/usr/local/bin/pkg";
+const SELF_UPDATE_DISABLE_FLAG: &str = "--no-self-update";
+#[cfg(feature = "self-update")]
+const SELF_UPDATE_REPO: &str = "mxcl/pkg";
 const ROOT_RECEIPT: &str = ".pkg/root-receipt.json";
 const RECEIPT: &str = ".pkg/receipt.json";
 const RECEIPTS_DIR: &str = ".pkg/receipts";
@@ -176,6 +181,28 @@ struct GhcrTokenResponse {
     token: String,
 }
 
+#[cfg(feature = "self-update")]
+#[derive(Debug, Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[cfg(feature = "self-update")]
+#[derive(Debug, Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[cfg(feature = "self-update")]
+#[derive(Debug)]
+struct SelfUpdateRelease {
+    version: semver::Version,
+    asset_name: String,
+    download_url: String,
+}
+
 #[derive(Debug, Clone)]
 struct InstalledFormula {
     spec: FormulaSpec,
@@ -228,6 +255,12 @@ struct IRequest {
 #[derive(Debug, PartialEq, Eq)]
 struct UninstallRequest {
     packages: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct UpdateRequest {
+    selection: PackageSelection,
+    no_self_update: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -777,7 +810,7 @@ fn run_outdated(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
 }
 
 fn run_update(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
-    let request = match parse_package_status_request(invocation, &mut args, print_update_usage)? {
+    let request = match parse_update_request(invocation, &mut args)? {
         Some(request) => request,
         None => return Ok(()),
     };
@@ -785,6 +818,8 @@ fn run_update(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), Stri
     if !is_root() {
         return Err("must be run as root".to_string());
     }
+
+    maybe_self_update_and_restart(&request)?;
 
     let config = load_config()?;
     for package in resolve_outdated_package_statuses(&config, &request.selection)? {
@@ -1095,6 +1130,13 @@ fn parse_uninstall_request(
     parse_uninstall_request_from_iter(invocation, args)
 }
 
+fn parse_update_request(
+    invocation: &Invocation,
+    args: &mut env::ArgsOs,
+) -> Result<Option<UpdateRequest>, String> {
+    parse_update_request_from_iter(invocation, args)
+}
+
 fn parse_package_status_request(
     invocation: &Invocation,
     args: &mut env::ArgsOs,
@@ -1161,6 +1203,47 @@ where
     }
 
     Ok(Some(UninstallRequest { packages }))
+}
+
+fn parse_update_request_from_iter<I>(
+    invocation: &Invocation,
+    args: I,
+) -> Result<Option<UpdateRequest>, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let mut no_self_update = false;
+    let mut packages = Vec::new();
+
+    for arg in args {
+        if is_help_flag(&arg) {
+            print_update_usage(&invocation.name);
+            return Ok(None);
+        }
+
+        if is_version_flag(&arg) {
+            println!("{} {}", invocation.name, env!("CARGO_PKG_VERSION"));
+            return Ok(None);
+        }
+
+        if is_no_self_update_flag(&arg) {
+            no_self_update = true;
+            continue;
+        }
+
+        packages.push(parse_package_name(&arg)?);
+    }
+
+    let selection = if packages.is_empty() {
+        PackageSelection::AllInstalled
+    } else {
+        PackageSelection::Requested(packages)
+    };
+
+    Ok(Some(UpdateRequest {
+        selection,
+        no_self_update,
+    }))
 }
 
 fn parse_package_status_request_from_iter<I>(
@@ -1425,6 +1508,140 @@ fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
         }
         _ => RequestedPackage::Auto(status.package_name.clone()),
     }
+}
+
+#[cfg(not(feature = "self-update"))]
+fn maybe_self_update_and_restart(_request: &UpdateRequest) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(feature = "self-update")]
+fn maybe_self_update_and_restart(request: &UpdateRequest) -> Result<(), String> {
+    if request.no_self_update || !running_from_self_update_target() {
+        return Ok(());
+    }
+
+    let Some(release) = resolve_self_update_release()? else {
+        return Ok(());
+    };
+
+    install_self_update(&release)?;
+    exec_self_update_restart()
+}
+
+#[cfg(feature = "self-update")]
+fn running_from_self_update_target() -> bool {
+    env::current_exe()
+        .ok()
+        .is_some_and(|path| path == Path::new(SELF_UPDATE_TARGET))
+}
+
+#[cfg(feature = "self-update")]
+fn resolve_self_update_release() -> Result<Option<SelfUpdateRelease>, String> {
+    let release: GithubRelease = fetch_json(
+        &format!("https://api.github.com/repos/{SELF_UPDATE_REPO}/releases/latest"),
+        || format!("failed to fetch latest release for {SELF_UPDATE_REPO}"),
+    )?;
+    let current_version = semver::Version::parse(env!("CARGO_PKG_VERSION"))
+        .map_err(|err| format!("failed to parse current pkg version: {err}"))?;
+    let latest_version = parse_self_update_version(&release.tag_name)?;
+    if latest_version <= current_version {
+        return Ok(None);
+    }
+
+    let asset_name = current_self_update_asset_name(&latest_version).ok_or_else(|| {
+        format!(
+            "self-update is unsupported on {}-{}",
+            env::consts::OS,
+            env::consts::ARCH
+        )
+    })?;
+    let asset = release
+        .assets
+        .into_iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| {
+            format!(
+                "latest pkg release {} does not contain asset {}",
+                release.tag_name, asset_name
+            )
+        })?;
+
+    Ok(Some(SelfUpdateRelease {
+        version: latest_version,
+        asset_name,
+        download_url: asset.browser_download_url,
+    }))
+}
+
+#[cfg(feature = "self-update")]
+fn parse_self_update_version(tag: &str) -> Result<semver::Version, String> {
+    semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag))
+        .map_err(|err| format!("failed to parse release version {tag}: {err}"))
+}
+
+#[cfg(feature = "self-update")]
+fn current_self_update_asset_name(version: &semver::Version) -> Option<String> {
+    self_update_asset_name_for(version, env::consts::OS, env::consts::ARCH)
+}
+
+#[cfg(feature = "self-update")]
+fn self_update_asset_name_for(version: &semver::Version, os: &str, arch: &str) -> Option<String> {
+    let os = match os {
+        "macos" => "Darwin",
+        "linux" => "Linux",
+        _ => return None,
+    };
+    let arch = match arch {
+        "aarch64" => "arm64",
+        "x86_64" => "x86_64",
+        _ => return None,
+    };
+    Some(format!("pkg-{version}-{os}-{arch}.tar.gz"))
+}
+
+#[cfg(feature = "self-update")]
+fn install_self_update(release: &SelfUpdateRelease) -> Result<(), String> {
+    let target = Path::new(SELF_UPDATE_TARGET);
+    let target_permissions = fs::metadata(target)
+        .map_err(|err| format!("failed to stat {}: {err}", target.display()))?
+        .permissions();
+    let temp_dir = TempDir::new_in(USR_LOCAL_BIN)
+        .map_err(|err| format!("failed to create temp dir in {USR_LOCAL_BIN}: {err}"))?;
+    let archive_path = temp_dir.path().join(&release.asset_name);
+    download_vendor_asset(&release.download_url, &archive_path, "pkg", None)?;
+    unpack_bottle(&archive_path, temp_dir.path())?;
+
+    let extracted = temp_dir.path().join("pkg");
+    let metadata = fs::metadata(&extracted)
+        .map_err(|err| format!("failed to stat {}: {err}", extracted.display()))?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "self-update archive for pkg {} did not contain a pkg binary",
+            release.version
+        ));
+    }
+
+    fs::set_permissions(&extracted, target_permissions)
+        .map_err(|err| format!("failed to chmod {}: {err}", extracted.display()))?;
+    fs::rename(&extracted, target).map_err(|err| {
+        format!(
+            "failed to replace {} with pkg {}: {err}",
+            target.display(),
+            release.version
+        )
+    })
+}
+
+#[cfg(feature = "self-update")]
+fn exec_self_update_restart() -> Result<(), String> {
+    let mut command = Command::new(SELF_UPDATE_TARGET);
+    for arg in env::args_os().skip(1) {
+        command.arg(arg);
+    }
+    command.arg(SELF_UPDATE_DISABLE_FLAG);
+    let err = command.exec();
+    Err(format!("failed to exec {}: {err}", SELF_UPDATE_TARGET))
 }
 
 fn installed_package_names(opt_root: &Path) -> Result<Vec<String>, String> {
@@ -2446,6 +2663,10 @@ fn is_version_flag(value: &OsString) -> bool {
 
 fn is_shebang_flag(value: &OsString) -> bool {
     matches!(value.to_str(), Some("-!" | "--shebang"))
+}
+
+fn is_no_self_update_flag(value: &OsString) -> bool {
+    matches!(value.to_str(), Some(SELF_UPDATE_DISABLE_FLAG))
 }
 
 fn is_uninstall_subcommand(value: &str) -> bool {
@@ -4539,6 +4760,56 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_update_request_without_args_selects_all_installed() {
+        let invocation = Invocation {
+            binary_name: "pkg".to_string(),
+            name: "pkg update".to_string(),
+            mode: None,
+        };
+        let request =
+            parse_update_request_from_iter(&invocation, Vec::<OsString>::new().into_iter())
+                .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UpdateRequest {
+                selection: PackageSelection::AllInstalled,
+                no_self_update: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_update_request_accepts_packages_and_hidden_self_update_flag() {
+        let invocation = Invocation {
+            binary_name: "pkg".to_string(),
+            name: "pkg update".to_string(),
+            mode: None,
+        };
+        let request = parse_update_request_from_iter(
+            &invocation,
+            vec![
+                OsString::from("ffmpeg"),
+                OsString::from(SELF_UPDATE_DISABLE_FLAG),
+                OsString::from("brew.sh/python@3.12"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UpdateRequest {
+                selection: PackageSelection::Requested(vec![
+                    RequestedPackage::Auto("ffmpeg".to_string()),
+                    RequestedPackage::HomebrewFormula("python@3.12".to_string()),
+                ]),
+                no_self_update: true,
+            })
+        );
+    }
+
+    #[test]
     fn ensure_package_installed_reports_missing_package() {
         let temp = TempDir::new().unwrap();
 
@@ -4785,6 +5056,33 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             extract_semver_from_text("node v22.18.0").unwrap(),
             semver::Version::parse("22.18.0").unwrap()
+        );
+    }
+
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn parse_self_update_version_strips_leading_v() {
+        assert_eq!(
+            parse_self_update_version("v0.1.0").unwrap(),
+            semver::Version::parse("0.1.0").unwrap()
+        );
+    }
+
+    #[cfg(feature = "self-update")]
+    #[test]
+    fn self_update_asset_name_for_uses_release_naming() {
+        let version = semver::Version::parse("0.1.0").unwrap();
+        assert_eq!(
+            self_update_asset_name_for(&version, "macos", "aarch64"),
+            Some("pkg-0.1.0-Darwin-arm64.tar.gz".to_string())
+        );
+        assert_eq!(
+            self_update_asset_name_for(&version, "linux", "x86_64"),
+            Some("pkg-0.1.0-Linux-x86_64.tar.gz".to_string())
+        );
+        assert_eq!(
+            self_update_asset_name_for(&version, "windows", "x86_64"),
+            None
         );
     }
 

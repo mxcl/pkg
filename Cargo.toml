@@ -4,6 +4,9 @@ version = "0.2.0"
 edition = "2024"
 autobins = false
 
+[features]
+self-update = []
+
 [[bin]]
 name = "pkg"
 path = "src/bin/pkg.rs"
