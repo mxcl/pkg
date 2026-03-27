@@ -26,6 +26,7 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/pkg | sudo tar -xzC /usr/local/b
 - Dependencies of Homebrew packages are installed alongside, ie. a self contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
 - `pkg use PKG` can run anything ephemerally (downloads fresh every time)
+- Agent focused: we package openclaw, clawhub and qmd
 
 ## Usage
 
@@ -36,15 +37,13 @@ $ sudo pkg install openclaw
 /usr/local/bin/openclaw -> /opt/openclaw/bin/openclaw
 # we shouldn’t let OpenClaw modify itself!
 
-$ sudo pkg uninstall openclaw
-$ sudo pkg rm openclaw
+$ sudo pkg uninstall openclaw  # alias: rm
 
 $ pkg outdated
 
 $ sudo pkg update
 
-$ sudo pkg list
-$ sudo pkg ls
+$ sudo pkg list  # alias: ls
 ```
 
 ## Is This Ready For Me?
@@ -71,11 +70,11 @@ days. Homebrew is 16 years old.
   We may figure out how to support these. But for now we’re just not going to
   do this because we assume we will screw it up.
   - `service` metadata does not block install, but `pkg` does not manage
-    those services for you
+    those services for you. The service plist is in `/opt/foo` if you want.
 
 ### Caveats Relative to Brew Specifically
 
-- We do not and never will support casks
+- We do not and will likely never support casks.
 - Many vast formula like imagemagick-full and ffmpeg-full just aint gunna
   install until we go through all the deps with complex install hooks and
   rewrite them to be more self contained. We may never do this.
