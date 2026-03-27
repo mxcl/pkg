@@ -240,6 +240,7 @@ mod tests {
     #[test]
     fn vendor_packages_expose_dependencies() {
         assert_eq!(get("codex").unwrap().dependencies, ["ripgrep"]);
+        assert_eq!(get("qmd").unwrap().dependencies, ["node", "sqlite"]);
     }
 
     #[test]

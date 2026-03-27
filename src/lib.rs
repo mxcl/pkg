@@ -999,7 +999,19 @@ fn run_i_vendor(
             &config.bottle_tag,
         )? {
             if !dependencies_reinstalled {
-                prepare_vendor_root_area(&plan)?;
+                if dependencies.formula_graph.is_empty() && dependencies.vendor_installs.is_empty()
+                {
+                    prepare_vendor_root_area(&plan)?;
+                } else {
+                    reinstall_vendor_dependency_tree(
+                        config,
+                        &plan,
+                        &dependency_state.installs,
+                        &dependencies.formula_graph,
+                        &dependencies.vendor_installs,
+                        Some(&progress),
+                    )?;
+                }
             }
             install_vendor_root(
                 &plan,
@@ -1845,6 +1857,19 @@ fn install_vendor_dependencies(
         )?;
     }
     Ok(())
+}
+
+fn reinstall_vendor_dependency_tree(
+    config: &Config,
+    plan: &InstallPlan,
+    installs: &[InstalledFormula],
+    graph: &[FormulaSpec],
+    vendor_installs: &[VendorInstall],
+    progress: Option<&InstallProgress>,
+) -> Result<(), String> {
+    prepare_vendor_root_area(plan)?;
+    install_dependency_formulas(config, plan, installs, progress)?;
+    install_vendor_dependencies(plan, graph, vendor_installs, progress)
 }
 
 fn resolve_dependency_install_state(
@@ -5920,6 +5945,56 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn reinstall_vendor_dependency_tree_restores_formula_dependencies() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "qmd".to_string(),
+            root_formula: "qmd".to_string(),
+            stable_root: temp.path().join("qmd"),
+            install_root: temp.path().join("qmd"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        fs::create_dir_all(&plan.tmp_root).unwrap();
+        fs::create_dir_all(plan.install_root.join("bin")).unwrap();
+        fs::write(plan.install_root.join("bin/qmd"), b"#!/bin/sh\n").unwrap();
+
+        let sqlite_archive = temp.path().join("sqlite.tar.gz");
+        write_test_bottle_archive(
+            &sqlite_archive,
+            "sqlite",
+            "3.49.1",
+            &[("bin/sqlite3", b"#!/bin/sh\n")],
+        );
+
+        let installs = vec![InstalledFormula {
+            spec: FormulaSpec {
+                name: "sqlite".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/sqlite.tar.gz".to_string(),
+            },
+            keg_dir_name: "3.49.1".to_string(),
+            archive_path: sqlite_archive,
+        }];
+
+        reinstall_vendor_dependency_tree(
+            &Config {
+                bottle_tag: "arm64_tahoe".to_string(),
+            },
+            &plan,
+            &installs,
+            &[],
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.install_root.join("bin/sqlite3").is_file());
+        assert!(plan.receipt_path("sqlite").is_file());
+        assert!(!plan.install_root.join("bin/qmd").exists());
+    }
+
+    #[test]
     fn remove_package_stubs_preserves_shared_entries() {
         let temp = TempDir::new().unwrap();
         let opt_root = temp.path().join("opt");
@@ -6183,5 +6258,30 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             },
             version: semver::Version::parse(version).unwrap(),
         }
+    }
+
+    fn write_test_bottle_archive(
+        archive_path: &Path,
+        formula: &str,
+        keg_dir: &str,
+        files: &[(&str, &[u8])],
+    ) {
+        let file = File::create(archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+
+        for (path, contents) in files {
+            let archive_path = format!("{formula}/{keg_dir}/{path}");
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, archive_path, *contents)
+                .unwrap();
+        }
+
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap();
     }
 }
