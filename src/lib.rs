@@ -2602,22 +2602,23 @@ fn resolve_formula_spec(
     resolved: &mut HashMap<String, FormulaInfo>,
     order: &mut Vec<String>,
 ) -> Result<(), String> {
-    if resolved.contains_key(formula) {
+    let formula = canonical_formula_name(formula)?;
+    if resolved.contains_key(&formula) {
         return Ok(());
     }
-    if !visiting.insert(formula.to_string()) {
+    if !visiting.insert(formula.clone()) {
         return Err(format!("cyclic formula dependency detected at {formula}"));
     }
 
-    let info = fetch_formula_info(formula)?;
+    let info = fetch_formula_info(&formula)?;
     if info.disabled {
         return Err(format!("formula {formula} is disabled"));
     }
-    if formula_has_unsupported_install_hooks(formula, &info, allow_supported_post_install) {
+    if formula_has_unsupported_install_hooks(&formula, &info, allow_supported_post_install) {
         let mut stderr = std::io::stderr();
-        handle_unsupported_formula(formula, &mut stderr)?;
+        handle_unsupported_formula(&formula, &mut stderr)?;
     }
-    ensure_formula_has_bottle(formula, &info, &config.bottle_tag)?;
+    ensure_formula_has_bottle(&formula, &info, &config.bottle_tag)?;
 
     let dependencies = info.dependencies.clone();
     for dependency in dependencies {
@@ -2631,9 +2632,9 @@ fn resolve_formula_spec(
         )?;
     }
 
-    visiting.remove(formula);
-    resolved.insert(formula.to_string(), info);
-    order.push(formula.to_string());
+    visiting.remove(&formula);
+    resolved.insert(formula.clone(), info);
+    order.push(formula);
     Ok(())
 }
 
@@ -2700,6 +2701,23 @@ fn fetch_formula_info_by_api_name(
 fn resolve_formula_api_alias(formula: &str) -> Result<Option<String>, String> {
     let index = formula_alias_index()?;
     Ok(index.get(formula).cloned())
+}
+
+fn canonical_formula_name(formula: &str) -> Result<String, String> {
+    Ok(canonical_formula_name_with_aliases(
+        formula,
+        formula_alias_index()?,
+    ))
+}
+
+fn canonical_formula_name_with_aliases(
+    formula: &str,
+    aliases: &HashMap<String, String>,
+) -> String {
+    aliases
+        .get(formula)
+        .cloned()
+        .unwrap_or_else(|| formula.to_string())
 }
 
 fn formula_alias_index() -> Result<&'static HashMap<String, String>, String> {
@@ -4281,6 +4299,24 @@ package or `bar` for the package that provides the `foo` executable"
         let aliases = collect_formula_aliases(vec![formula_index_entry("foo", &[], &["foo-old"])]);
 
         assert_eq!(aliases.get("foo-old").map(String::as_str), Some("foo"));
+    }
+
+    #[test]
+    fn canonical_formula_name_with_aliases_prefers_canonical_formula_name() {
+        let aliases = collect_formula_aliases(vec![formula_index_entry(
+            "python@3.14",
+            &["python", "python3"],
+            &[],
+        )]);
+
+        assert_eq!(
+            canonical_formula_name_with_aliases("python", &aliases),
+            "python@3.14"
+        );
+        assert_eq!(
+            canonical_formula_name_with_aliases("python@3.14", &aliases),
+            "python@3.14"
+        );
     }
 
     #[test]
