@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -3359,6 +3359,10 @@ fn build_rewrite_rules(plan: &InstallPlan, installs: &[InstalledFormula]) -> Vec
             destination: target.clone(),
         });
         rules.push(RewriteRule {
+            source: format!("{RELOCATABLE_HOMEBREW_PREFIX}/opt/{}", install.spec.name),
+            destination: target.clone(),
+        });
+        rules.push(RewriteRule {
             source: format!("{HOMEBREW_PREFIX_PLACEHOLDER}/opt/{}", install.spec.name),
             destination: target.clone(),
         });
@@ -3385,6 +3389,10 @@ fn build_rewrite_rules(plan: &InstallPlan, installs: &[InstalledFormula]) -> Vec
             });
             rules.push(RewriteRule {
                 source: escaped_placeholder_cellar,
+                destination: target.clone(),
+            });
+            rules.push(RewriteRule {
+                source: format!("{RELOCATABLE_HOMEBREW_PREFIX}/opt/{escaped_name}"),
                 destination: target.clone(),
             });
             rules.push(RewriteRule {
@@ -5256,12 +5264,13 @@ package or `bar` for the package that provides the `foo` executable"
         assert!(rules.iter().any(|rule| {
             rule.source == "/opt/homebrew/Cellar/glow/2.1.1" && rule.destination == "/tmp/x/glow"
         }));
+        assert!(rules.iter().any(|rule| {
+            rule.source == "/opt/homebrew/opt/glow" && rule.destination == "/tmp/x/glow"
+        }));
         assert!(!rules.iter().any(|rule| rule.source.contains("/usr/local")));
-        assert!(
-            !rules
-                .iter()
-                .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew"))
-        );
+        assert!(!rules
+            .iter()
+            .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew")));
         assert!(rules.iter().any(|rule| {
             rule.source == HOMEBREW_PREFIX_PLACEHOLDER && rule.destination == "/tmp/x/glow"
         }));
@@ -5295,6 +5304,29 @@ package or `bar` for the package that provides the `foo` executable"
         )
         .unwrap();
         assert!(rewritten.starts_with("#!/usr/bin/perl"));
+    }
+
+    #[test]
+    fn rewrite_text_rewrites_raw_homebrew_opt_dependency_paths() {
+        let plan = InstallPlan::for_i("direnv".to_string(), "direnv".to_string());
+        let installs = vec![InstalledFormula {
+            spec: FormulaSpec {
+                name: "bash".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/bash.tar.gz".to_string(),
+            },
+            keg_dir_name: "5.3.9".to_string(),
+            archive_path: PathBuf::from("/tmp/bash.tar.gz"),
+        }];
+        let rules = build_rewrite_rules(&plan, &installs);
+        let rewritten = rewrite_text(
+            "/opt/homebrew/opt/bash/bin/bash\n",
+            Path::new("/tmp/direnv"),
+            "direnv",
+            &rules,
+        )
+        .unwrap();
+        assert_eq!(rewritten, "/opt/direnv/bin/bash\n");
     }
 
     #[test]
