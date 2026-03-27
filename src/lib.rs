@@ -767,14 +767,28 @@ fn run_outdated(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
     };
 
     let config = load_config()?;
-    for package in resolve_package_statuses(&config, &request.selection)?
-        .into_iter()
-        .filter(PackageStatus::is_outdated)
-    {
+    for package in resolve_outdated_package_statuses(&config, &request.selection)? {
         println!(
             "{} {} -> {}",
             package.package_name, package.installed_version, package.latest_version
         );
+    }
+    Ok(())
+}
+
+fn run_update(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
+    let request = match parse_package_status_request(invocation, &mut args, print_update_usage)? {
+        Some(request) => request,
+        None => return Ok(()),
+    };
+
+    if !is_root() {
+        return Err("must be run as root".to_string());
+    }
+
+    let config = load_config()?;
+    for package in resolve_outdated_package_statuses(&config, &request.selection)? {
+        run_i_package(&config, requested_package_from_status(&package))?;
     }
     Ok(())
 }
@@ -817,6 +831,9 @@ fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
                 Some(subcommand) if is_outdated_subcommand(subcommand) => {
                     print_outdated_usage(&format!("{} {}", invocation.binary_name, subcommand));
                 }
+                Some(subcommand) if is_update_subcommand(subcommand) => {
+                    print_update_usage(&format!("{} {}", invocation.binary_name, subcommand));
+                }
                 Some(subcommand) if is_list_subcommand(subcommand) => {
                     print_list_usage(&format!("{} {}", invocation.binary_name, subcommand));
                 }
@@ -854,6 +871,16 @@ fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
     }
     if is_outdated_subcommand(subcommand) {
         return run_outdated(
+            &Invocation {
+                binary_name: invocation.binary_name.clone(),
+                name: format!("{} {subcommand}", invocation.binary_name),
+                mode: None,
+            },
+            args,
+        );
+    }
+    if is_update_subcommand(subcommand) {
+        return run_update(
             &Invocation {
                 binary_name: invocation.binary_name.clone(),
                 name: format!("{} {subcommand}", invocation.binary_name),
@@ -1307,6 +1334,22 @@ fn resolve_package_statuses(
     }
 }
 
+fn resolve_outdated_package_statuses(
+    config: &Config,
+    selection: &PackageSelection,
+) -> Result<Vec<PackageStatus>, String> {
+    Ok(filter_outdated_package_statuses(resolve_package_statuses(
+        config, selection,
+    )?))
+}
+
+fn filter_outdated_package_statuses(statuses: Vec<PackageStatus>) -> Vec<PackageStatus> {
+    statuses
+        .into_iter()
+        .filter(PackageStatus::is_outdated)
+        .collect()
+}
+
 fn resolve_scanned_package_statuses<Resolve, Warn>(
     mut package_names: Vec<String>,
     mut resolve: Resolve,
@@ -1372,6 +1415,15 @@ fn requested_package_name(package: &RequestedPackage) -> String {
         RequestedPackage::Auto(package_name) | RequestedPackage::HomebrewFormula(package_name) => {
             package_name.clone()
         }
+    }
+}
+
+fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
+    match &status.source {
+        PackageReceiptSource::Formula { root_formula } if status.package_name == *root_formula => {
+            RequestedPackage::HomebrewFormula(root_formula.clone())
+        }
+        _ => RequestedPackage::Auto(status.package_name.clone()),
     }
 }
 
@@ -2353,6 +2405,12 @@ fn print_outdated_usage(program: &str) {
     println!("Lists installed packages with newer versions available.");
 }
 
+fn print_update_usage(program: &str) {
+    println!("Usage: {program} [package|brew.sh/formula]...");
+    println!();
+    println!("Reinstalls installed packages with newer versions available.");
+}
+
 fn print_list_usage(program: &str) {
     println!("Usage: {program} [package|brew.sh/formula]...");
     println!();
@@ -2367,6 +2425,7 @@ fn print_pkg_usage(program: &str) {
     println!("  install, i   Install a self-contained package.");
     println!("  list, ls     List installed packages with their versions.");
     println!("  outdated     List installed packages with updates available.");
+    println!("  update       Reinstall installed packages with updates available.");
     println!("  uninstall, rm Remove an installed package.");
 }
 
@@ -2395,6 +2454,10 @@ fn is_uninstall_subcommand(value: &str) -> bool {
 
 fn is_outdated_subcommand(value: &str) -> bool {
     value == "outdated"
+}
+
+fn is_update_subcommand(value: &str) -> bool {
+    value == "update"
 }
 
 fn is_list_subcommand(value: &str) -> bool {
@@ -2710,10 +2773,7 @@ fn canonical_formula_name(formula: &str) -> Result<String, String> {
     ))
 }
 
-fn canonical_formula_name_with_aliases(
-    formula: &str,
-    aliases: &HashMap<String, String>,
-) -> String {
+fn canonical_formula_name_with_aliases(formula: &str, aliases: &HashMap<String, String>) -> String {
     aliases
         .get(formula)
         .cloned()
@@ -4563,6 +4623,13 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn is_update_subcommand_accepts_update_only() {
+        assert!(is_update_subcommand("update"));
+        assert!(!is_update_subcommand("outdated"));
+        assert!(!is_update_subcommand("install"));
+    }
+
+    #[test]
     fn installed_package_names_skip_hidden_entries_and_files() {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join("deno")).unwrap();
@@ -4606,6 +4673,73 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             warnings,
             vec!["warning: skipping /opt/scratch: package scratch is installed but missing package metadata".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_outdated_package_statuses_filters_up_to_date_entries() {
+        let statuses = vec![
+            PackageStatus {
+                package_name: "deno".to_string(),
+                source: PackageReceiptSource::Vendor {
+                    vendor_name: "deno".to_string(),
+                },
+                installed_version: "2.7.7".to_string(),
+                latest_version: "2.7.8".to_string(),
+            },
+            PackageStatus {
+                package_name: "gh".to_string(),
+                source: PackageReceiptSource::Vendor {
+                    vendor_name: "gh".to_string(),
+                },
+                installed_version: "2.80.0".to_string(),
+                latest_version: "2.80.0".to_string(),
+            },
+        ];
+        let outdated = filter_outdated_package_statuses(statuses);
+
+        assert_eq!(outdated.len(), 1);
+        assert_eq!(outdated[0].package_name, "deno");
+    }
+
+    #[test]
+    fn requested_package_from_status_preserves_formula_identity() {
+        let formula = PackageStatus {
+            package_name: "python@3.12".to_string(),
+            source: PackageReceiptSource::Formula {
+                root_formula: "python@3.12".to_string(),
+            },
+            installed_version: "3.12.10".to_string(),
+            latest_version: "3.12.11".to_string(),
+        };
+        let alias = PackageStatus {
+            package_name: "ffmpeg".to_string(),
+            source: PackageReceiptSource::Formula {
+                root_formula: "ffmpeg-full".to_string(),
+            },
+            installed_version: "8.0".to_string(),
+            latest_version: "8.1".to_string(),
+        };
+        let vendor = PackageStatus {
+            package_name: "deno".to_string(),
+            source: PackageReceiptSource::Vendor {
+                vendor_name: "deno".to_string(),
+            },
+            installed_version: "2.7.7".to_string(),
+            latest_version: "2.7.8".to_string(),
+        };
+
+        assert_eq!(
+            requested_package_from_status(&formula),
+            RequestedPackage::HomebrewFormula("python@3.12".to_string())
+        );
+        assert_eq!(
+            requested_package_from_status(&alias),
+            RequestedPackage::Auto("ffmpeg".to_string())
+        );
+        assert_eq!(
+            requested_package_from_status(&vendor),
+            RequestedPackage::Auto("deno".to_string())
         );
     }
 
@@ -5087,7 +5221,9 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             "post_install_defined": false
         }))
         .unwrap();
-        assert!(!formula_has_unsupported_install_hooks("example", &info, false));
+        assert!(!formula_has_unsupported_install_hooks(
+            "example", &info, false
+        ));
     }
 
     #[test]
