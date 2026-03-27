@@ -36,7 +36,7 @@ pub fn download_url(version: &Version) -> String {
 
 pub fn install(_version: &Version) -> InstallStrategy {
     InstallStrategy::CopyFile {
-        source: "bun/bun".to_string(),
+        source: "bun-darwin-aarch64/bun".to_string(),
         destination_dir: "bin".to_string(),
         destination_name: None,
         mode: 0o755,

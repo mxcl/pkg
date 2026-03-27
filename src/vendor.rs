@@ -263,4 +263,26 @@ mod tests {
             _ => panic!("codex should install from a downloaded binary asset"),
         }
     }
+
+    #[test]
+    fn bun_installs_platform_binary_from_archive_subdirectory() {
+        let version = Version::parse("1.2.3").unwrap();
+        let strategy = bun::install(&version);
+        match strategy {
+            InstallStrategy::CopyFile {
+                source,
+                destination_dir,
+                destination_name,
+                mode,
+                create_dirs,
+            } => {
+                assert_eq!(source, "bun-darwin-aarch64/bun");
+                assert_eq!(destination_dir, "bin");
+                assert_eq!(destination_name, None);
+                assert_eq!(mode, 0o755);
+                assert_eq!(create_dirs, vec!["bin".to_string()]);
+            }
+            _ => panic!("bun should install from the extracted archive directory"),
+        }
+    }
 }
