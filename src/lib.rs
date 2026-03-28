@@ -250,6 +250,7 @@ enum RequestedPackage {
 #[derive(Debug, PartialEq, Eq)]
 struct IRequest {
     packages: Vec<RequestedPackage>,
+    force: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -451,7 +452,7 @@ impl InstallPlan {
 
     fn stable_target_dir(&self, formula: &str) -> PathBuf {
         if self.mode == Mode::I || formula == self.root_formula {
-            self.install_root.clone()
+            self.stable_root.clone()
         } else {
             self.stable_root.join("pkgs").join(formula)
         }
@@ -480,6 +481,26 @@ impl InstallPlan {
     fn root_executables_manifest_path(&self) -> PathBuf {
         self.install_root.join(ROOT_EXECUTABLES_MANIFEST)
     }
+}
+
+fn prepare_i_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, Option<TempDir>), String> {
+    if plan.mode != Mode::I {
+        return Ok((plan.clone(), None));
+    }
+
+    fs::create_dir_all(&plan.tmp_root)
+        .map_err(|err| format!("failed to create {}: {err}", plan.tmp_root.display()))?;
+    let workspace = TempDir::new_in(&plan.tmp_root).map_err(|err| {
+        format!(
+            "failed to create staging dir in {}: {err}",
+            plan.tmp_root.display()
+        )
+    })?;
+    let staged_plan = InstallPlan {
+        install_root: workspace.path().join("install"),
+        ..plan.clone()
+    };
+    Ok((staged_plan, Some(workspace)))
 }
 
 impl PackageStatus {
@@ -691,12 +712,13 @@ fn run_i(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
 
     let config = load_config()?;
     for package in request.packages {
-        run_i_package(&config, package)?;
+        run_i_package(&config, package, request.force)?;
     }
     Ok(())
 }
 
-fn run_i_package(config: &Config, requested: RequestedPackage) -> Result<(), String> {
+fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> Result<(), String> {
+    ensure_installable_package(&requested_package_name(&requested), force)?;
     match requested {
         RequestedPackage::Auto(package_name) => {
             if let Some(package) = vendor::get(&package_name) {
@@ -723,22 +745,32 @@ fn run_i_formula(
             .last()
             .map(|spec| spec.name.clone())
             .ok_or_else(|| "no formula resolved".to_string())?;
-        let tmp_root = PathBuf::from(OPT_PKG_ROOT).join(".tmp");
-        fs::create_dir_all(&tmp_root)
-            .map_err(|err| format!("failed to create {}: {err}", tmp_root.display()))?;
-        let downloads = download_bottles(&graph, &tmp_root, Some(&progress))?;
+        let plan = InstallPlan::for_i(package_name.clone(), root_formula);
+        let previous_stubs = load_stub_manifest(&plan.package_manifest_path())?.stubs;
+        let (staged_plan, _staging_workspace) = prepare_i_install_plan(&plan)?;
+        let downloads = download_bottles(&graph, &staged_plan.tmp_root, Some(&progress))?;
         progress.begin_install_phase();
         let installs = inspect_keg_dirs(&graph, &downloads)?;
         let root_install = installs
             .iter()
-            .find(|install| install.spec.name == root_formula)
-            .ok_or_else(|| format!("root formula {root_formula} not present in install graph"))?;
-        let plan = InstallPlan::for_i(package_name.clone(), root_formula);
+            .find(|install| install.spec.name == plan.root_formula)
+            .ok_or_else(|| {
+                format!(
+                    "root formula {} not present in install graph",
+                    plan.root_formula
+                )
+            })?;
 
-        ensure_plan_parent_dirs(&plan)?;
-        let rewrite_rules = build_rewrite_rules(&plan, &installs);
-        install_package(config, &plan, &installs, &rewrite_rules, Some(&progress))?;
-        activate_install(&plan)?;
+        ensure_plan_parent_dirs(&staged_plan)?;
+        let rewrite_rules = build_rewrite_rules(&staged_plan, &installs);
+        install_package(
+            config,
+            &staged_plan,
+            &installs,
+            &rewrite_rules,
+            Some(&progress),
+        )?;
+        activate_install(&staged_plan)?;
         write_package_receipt(
             &plan.root_receipt_path(),
             &PackageReceipt {
@@ -749,7 +781,7 @@ fn run_i_formula(
                 },
             },
         )?;
-        sync_stubs(&plan, &graph)?;
+        sync_stubs(&plan, &graph, &previous_stubs)?;
         run_package_post_install(&plan, &installs, Path::new(USR_LOCAL_BIN))?;
         installed_stub_paths(&plan)
     })();
@@ -823,7 +855,7 @@ fn run_update(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), Stri
 
     let config = load_config()?;
     for package in resolve_outdated_package_statuses(&config, &request.selection)? {
-        run_i_package(&config, requested_package_from_status(&package))?;
+        run_i_package(&config, requested_package_from_status(&package), true)?;
     }
     Ok(())
 }
@@ -949,27 +981,22 @@ fn run_i_vendor(
 ) -> Result<(), String> {
     let progress = InstallProgress::new(&package_name);
     let result = (|| {
+        let plan = InstallPlan::for_i(package_name.clone(), package.name.to_string());
+        let previous_stubs = load_stub_manifest(&plan.package_manifest_path())?.stubs;
+        let (staged_plan, _staging_workspace) = prepare_i_install_plan(&plan)?;
         let version = (package.version)()?;
         let vendor_install = VendorInstall { package, version };
         let dependencies =
             resolve_vendor_dependency_specs(vendor_install.package.dependencies, config, false)?;
-        let tmp_root = plan_tmp_root(&package_name);
-        fs::create_dir_all(&tmp_root)
-            .map_err(|err| format!("failed to create {}: {err}", tmp_root.display()))?;
         let dependency_state = resolve_dependency_install_state(
             &dependencies.formula_graph,
-            &tmp_root,
+            &staged_plan.tmp_root,
             Some(&progress),
         )?;
-        let plan = InstallPlan::for_i(
-            package_name.clone(),
-            vendor_install.package.name.to_string(),
-        );
-
-        ensure_plan_parent_dirs(&plan)?;
+        ensure_plan_parent_dirs(&staged_plan)?;
 
         let dependency_current = dependencies_are_current(
-            &plan,
+            &staged_plan,
             &dependency_state.installs,
             &dependencies.vendor_installs,
             config,
@@ -979,12 +1006,12 @@ fn run_i_vendor(
             progress.begin_install_phase();
             install_dependency_formulas(
                 config,
-                &plan,
+                &staged_plan,
                 &dependency_state.installs,
                 Some(&progress),
             )?;
             install_vendor_dependencies(
-                &plan,
+                &staged_plan,
                 &dependencies.formula_graph,
                 &dependencies.vendor_installs,
                 Some(&progress),
@@ -993,7 +1020,7 @@ fn run_i_vendor(
         }
 
         if !vendor_root_is_current(
-            &plan,
+            &staged_plan,
             &vendor_install,
             &dependency_state.installs,
             &config.bottle_tag,
@@ -1001,11 +1028,11 @@ fn run_i_vendor(
             if !dependencies_reinstalled {
                 if dependencies.formula_graph.is_empty() && dependencies.vendor_installs.is_empty()
                 {
-                    prepare_vendor_root_area(&plan)?;
+                    prepare_vendor_root_area(&staged_plan)?;
                 } else {
                     reinstall_vendor_dependency_tree(
                         config,
-                        &plan,
+                        &staged_plan,
                         &dependency_state.installs,
                         &dependencies.formula_graph,
                         &dependencies.vendor_installs,
@@ -1014,14 +1041,14 @@ fn run_i_vendor(
                 }
             }
             install_vendor_root(
-                &plan,
+                &staged_plan,
                 &dependencies.formula_graph,
                 &vendor_install,
                 Some(&progress),
             )?;
         }
 
-        activate_install(&plan)?;
+        activate_install(&staged_plan)?;
         write_package_receipt(
             &plan.root_receipt_path(),
             &PackageReceipt {
@@ -1032,7 +1059,12 @@ fn run_i_vendor(
                 },
             },
         )?;
-        sync_vendor_stubs(&plan, &dependencies.formula_graph, &vendor_install.package)?;
+        sync_vendor_stubs(
+            &plan,
+            &dependencies.formula_graph,
+            &vendor_install.package,
+            &previous_stubs,
+        )?;
         installed_stub_paths(&plan)
     })();
 
@@ -1159,32 +1191,39 @@ fn parse_package_status_request(
 
 fn parse_i_request_from_iter<I>(
     invocation: &Invocation,
-    mut args: I,
+    args: I,
 ) -> Result<Option<IRequest>, String>
 where
     I: Iterator<Item = OsString>,
 {
-    let Some(first_arg) = args.next() else {
-        print_i_usage(&invocation.name);
-        return Err("missing package name".to_string());
-    };
+    let mut force = false;
+    let mut packages = Vec::new();
 
-    if is_help_flag(&first_arg) {
-        print_i_usage(&invocation.name);
-        return Ok(None);
-    }
-
-    if is_version_flag(&first_arg) {
-        println!("{} {}", invocation.name, env!("CARGO_PKG_VERSION"));
-        return Ok(None);
-    }
-
-    let mut packages = vec![parse_package_name(&first_arg)?];
     for arg in args {
+        if is_help_flag(&arg) {
+            print_i_usage(&invocation.name);
+            return Ok(None);
+        }
+
+        if is_version_flag(&arg) {
+            println!("{} {}", invocation.name, env!("CARGO_PKG_VERSION"));
+            return Ok(None);
+        }
+
+        if is_force_flag(&arg) {
+            force = true;
+            continue;
+        }
+
         packages.push(parse_package_name(&arg)?);
     }
 
-    Ok(Some(IRequest { packages }))
+    if packages.is_empty() {
+        print_i_usage(&invocation.name);
+        return Err("missing package name".to_string());
+    }
+
+    Ok(Some(IRequest { packages, force }))
 }
 
 fn parse_uninstall_request_from_iter<I>(
@@ -2210,6 +2249,21 @@ fn activate_install(plan: &InstallPlan) -> Result<(), String> {
         return Ok(());
     }
 
+    if plan.install_root == plan.stable_root {
+        return Ok(());
+    }
+
+    if plan.stable_root.exists() {
+        remove_path(&plan.stable_root)?;
+    }
+    fs::rename(&plan.install_root, &plan.stable_root).map_err(|err| {
+        format!(
+            "failed to move {} to {}: {err}",
+            plan.install_root.display(),
+            plan.stable_root.display()
+        )
+    })?;
+
     Ok(())
 }
 
@@ -2233,6 +2287,18 @@ fn ensure_package_installed(opt_root: &Path, package_name: &str) -> Result<(), S
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             Err(format!("package {package_name} is not installed"))
         }
+        Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
+    }
+}
+
+fn ensure_installable_package(package_name: &str, force: bool) -> Result<(), String> {
+    let install_root = Path::new(OPT_PKG_ROOT).join(package_name);
+    match fs::symlink_metadata(&install_root) {
+        Ok(_) if force => Ok(()),
+        Ok(_) => Err(format!(
+            "package {package_name} is already installed; use --force/-f to reinstall"
+        )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
     }
 }
@@ -2360,7 +2426,11 @@ fn installed_post_install_formula(
     Ok(None)
 }
 
-fn sync_stubs(plan: &InstallPlan, graph: &[FormulaSpec]) -> Result<(), String> {
+fn sync_stubs(
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+    previous_stubs: &[String],
+) -> Result<(), String> {
     if plan.mode != Mode::I {
         return Ok(());
     }
@@ -2382,10 +2452,8 @@ fn sync_stubs(plan: &InstallPlan, graph: &[FormulaSpec]) -> Result<(), String> {
     } else {
         collect_root_executables(&plan.stable_root)?
     };
-    let previous = load_stub_manifest(&plan.package_manifest_path())?;
-
-    for stub in previous.stubs {
-        if !current.iter().any(|(name, _)| name == &stub) {
+    for stub in previous_stubs {
+        if !current.iter().any(|(name, _)| name == stub) {
             let path = PathBuf::from(USR_LOCAL_BIN).join(&stub);
             if path.exists() || fs::symlink_metadata(&path).is_ok() {
                 remove_path(&path)?;
@@ -2411,6 +2479,7 @@ fn sync_vendor_stubs(
     plan: &InstallPlan,
     graph: &[FormulaSpec],
     package: &vendor::VendorPackage,
+    previous_stubs: &[String],
 ) -> Result<(), String> {
     if plan.mode != Mode::I {
         return Ok(());
@@ -2419,10 +2488,8 @@ fn sync_vendor_stubs(
     fs::create_dir_all(USR_LOCAL_BIN)
         .map_err(|err| format!("failed to create {}: {err}", USR_LOCAL_BIN))?;
     let current = collect_declared_root_executables(&plan.install_root, package.executables)?;
-    let previous = load_stub_manifest(&plan.package_manifest_path())?;
-
-    for stub in previous.stubs {
-        if !current.iter().any(|(name, _)| name == &stub) {
+    for stub in previous_stubs {
+        if !current.iter().any(|(name, _)| name == stub) {
             let path = PathBuf::from(USR_LOCAL_BIN).join(&stub);
             if path.exists() || fs::symlink_metadata(&path).is_ok() {
                 remove_path(&path)?;
@@ -2630,7 +2697,7 @@ fn print_x_usage(program: &str) {
 }
 
 fn print_i_usage(program: &str) {
-    println!("Usage: {program} <package|brew.sh/formula>...");
+    println!("Usage: {program} [-f | --force] <package|brew.sh/formula>...");
     println!();
     println!("Installs self-contained packages under {OPT_PKG_ROOT}.");
 }
@@ -2684,6 +2751,10 @@ fn is_help_flag(value: &OsString) -> bool {
 
 fn is_version_flag(value: &OsString) -> bool {
     matches!(value.to_str(), Some("-V" | "--version"))
+}
+
+fn is_force_flag(value: &OsString) -> bool {
+    matches!(value.to_str(), Some("-f" | "--force"))
 }
 
 fn is_shebang_flag(value: &OsString) -> bool {
@@ -3984,11 +4055,7 @@ fn rewrite_binary(
             .unwrap_or(bytes.len());
         let segment = &bytes[start..end];
         if contains_relocatable_homebrew_reference_bytes(segment, rules) {
-            let rewritten = if let Ok(original) = std::str::from_utf8(segment) {
-                rewrite_binary_segment(original, path, formula, rules)?.into_bytes()
-            } else {
-                rewrite_binary_segment_bytes(segment, path, formula, rules)?
-            };
+            let rewritten = rewrite_binary_segment_bytes(segment, path, formula, rules)?;
             if rewritten.len() > segment.len() {
                 let original = String::from_utf8_lossy(segment);
                 let rewritten = String::from_utf8_lossy(&rewritten);
@@ -4038,24 +4105,6 @@ fn ensure_writable(path: &Path) -> Result<(), String> {
     permissions.set_mode(mode | 0o200);
     fs::set_permissions(path, permissions)
         .map_err(|err| format!("failed to make {} writable: {err}", path.display()))
-}
-
-fn rewrite_binary_segment(
-    segment: &str,
-    path: &Path,
-    formula: &str,
-    rules: &[RewriteRule],
-) -> Result<String, String> {
-    let mut rewritten = segment.to_string();
-    for rule in rules {
-        rewritten = rewrite_prefixes_in_text(&rewritten, rule);
-    }
-    if contains_relocatable_homebrew_reference_text(&rewritten, rules) {
-        return Err(unsupported_homebrew_rewrite_error(
-            "binary", formula, path, segment, &rewritten, rules,
-        ));
-    }
-    Ok(rewritten)
 }
 
 fn rewrite_binary_segment_bytes(
@@ -4770,6 +4819,7 @@ package or `bar` for the package that provides the `foo` executable"
                     RequestedPackage::Auto("cargo-binstall".to_string()),
                     RequestedPackage::Auto("cargo-zigbuild".to_string()),
                 ],
+                force: false,
             })
         );
     }
@@ -4801,6 +4851,7 @@ package or `bar` for the package that provides the `foo` executable"
             request,
             Some(IRequest {
                 packages: vec![RequestedPackage::HomebrewFormula("zopflipng".to_string(),)],
+                force: false,
             })
         );
     }
@@ -5244,6 +5295,10 @@ package or `bar` for the package that provides the `foo` executable"
     fn rewrite_binary_rewrites_openssl_cert_path_to_short_cert_path() {
         let plan = InstallPlan::for_i("python@3.12".to_string(), "python@3.12".to_string());
         let rules = build_rewrite_rules(&plan, &[]);
+        let expected = binary_rewrite_destination(&RewriteRule {
+            source: "/opt/homebrew/etc/openssl@3/cert.pem".to_string(),
+            destination: "/opt/python@3.12/ssl/cert.pem".to_string(),
+        });
         let mut bytes = b"prefix\0/opt/homebrew/etc/openssl@3/cert.pem\0".to_vec();
         let changed = rewrite_binary(
             &mut bytes,
@@ -5253,24 +5308,25 @@ package or `bar` for the package that provides the `foo` executable"
         )
         .unwrap();
         assert!(changed);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("/opt/python@3.12/ssl/cert.pem"));
-        assert!(!text.contains("/opt/homebrew/etc/openssl@3/cert.pem"));
+        assert!(find_subslice(&bytes, &expected).is_some());
+        assert!(find_subslice(&bytes, b"/opt/homebrew/etc/openssl@3/cert.pem").is_none());
     }
 
     #[test]
     fn rewrite_binary_rewrites_paths_inside_nul_delimited_segments() {
-        let rules = vec![RewriteRule {
+        let rule = RewriteRule {
             source: "/opt/homebrew/Cellar/gum/0.17.0".to_string(),
             destination: "/tmp/x/gum".to_string(),
-        }];
+        };
+        let rules = vec![rule.clone()];
         let mut bytes =
             b"prefix\0OPENSSLDIR: \"/opt/homebrew/Cellar/gum/0.17.0/bin/gum\"\0".to_vec();
         let changed = rewrite_binary(&mut bytes, Path::new("/tmp/gum"), "gum", &rules).unwrap();
         assert!(changed);
-        let text = String::from_utf8(bytes).unwrap();
-        assert!(text.contains("/tmp/x/gum/bin/gum"));
-        assert!(!text.contains("/opt/homebrew"));
+        let mut expected = binary_rewrite_destination(&rule);
+        expected.extend_from_slice(b"/bin/gum");
+        assert!(find_subslice(&bytes, &expected).is_some());
+        assert!(find_subslice(&bytes, b"/opt/homebrew").is_none());
     }
 
     #[test]
