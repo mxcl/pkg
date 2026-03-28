@@ -4991,11 +4991,20 @@ mod tests {
     }
 
     #[test]
-    fn resolve_i_root_formula_prefers_ffmpeg_full() {
+    fn resolve_i_root_formula_keeps_ffmpeg() {
         let db = test_db(&[]);
         assert_eq!(
             resolve_i_root_formula_with_db("ffmpeg", &db, |_| Ok(true)).unwrap(),
-            "ffmpeg-full"
+            "ffmpeg"
+        );
+    }
+
+    #[test]
+    fn resolve_i_root_formula_keeps_imagemagick() {
+        let db = test_db(&[]);
+        assert_eq!(
+            resolve_i_root_formula_with_db("imagemagick", &db, |_| Ok(true)).unwrap(),
+            "imagemagick"
         );
     }
 
@@ -6970,6 +6979,20 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn write_full_formula_recommendation_suggests_full_variants() {
+        let mut stderr = Vec::new();
+        write_full_formula_recommendation("ffmpeg", &mut stderr).unwrap();
+        write_full_formula_recommendation("imagemagick", &mut stderr).unwrap();
+        write_full_formula_recommendation("ripgrep", &mut stderr).unwrap();
+
+        assert_eq!(
+            String::from_utf8(stderr).unwrap(),
+            "info: requested `ffmpeg`; `brew.sh/ffmpeg-full` is recommended instead\n\
+info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead\n"
+        );
+    }
+
+    #[test]
     fn prepare_i_install_plan_stages_under_tmp_root() {
         let temp = TempDir::new().unwrap();
         let plan = InstallPlan {
@@ -7226,6 +7249,35 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert_eq!(request.tool, "python");
         assert_eq!(request.root_formula, "python@3.12");
         assert_eq!(request.tool_args, vec![OsString::from("--flag")]);
+    }
+
+    #[test]
+    fn parse_x_request_prefers_full_formula_variants() {
+        let invocation = Invocation::for_subcommand("p0r", "x", Mode::X);
+
+        let ffmpeg = parse_x_request_from_iter(
+            &invocation,
+            vec![OsString::from("ffmpeg"), OsString::from("-version")].into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(ffmpeg.root_formula, "ffmpeg-full");
+
+        let magick = parse_x_request_from_iter(
+            &invocation,
+            vec![OsString::from("magick"), OsString::from("--version")].into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(magick.root_formula, "imagemagick-full");
+
+        let explicit = parse_x_request_from_iter(
+            &invocation,
+            vec![OsString::from("+imagemagick"), OsString::from("convert")].into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit.root_formula, "imagemagick-full");
     }
 
     #[test]
