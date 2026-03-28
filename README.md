@@ -1,22 +1,23 @@
-# The PackageManaginat0r
+# Substrate
 
-[![Coverage Status](https://coveralls.io/repos/github/mxcl/the-package-managinat0r/badge.svg?branch=main)](https://coveralls.io/github/mxcl/the-package-managinat0r?branch=main)
+[![Coverage Status](https://coveralls.io/repos/github/mxcl/substrate/badge.svg?branch=main)](https://coveralls.io/github/mxcl/substrate?branch=main)
 
-Execution, performance and security focused package manager for macOS.
+Execution, performance and security oriented (universal) package manager for
+macOS with a special focus on agentic use cases.
 
 ## Install
 
-The PackageManaginat0r is a single binary with no dependencies.
+Substrate is a single binary with no dependencies.
 
 ```sh
-gh release download --repo mxcl/the-package-managinat0r --pattern 'ThePackageManaginat0r*.tar.gz'
-sudo tar xzf ThePackageManaginat0r*.tar.gz -C /usr/local/bin
+gh release download --repo mxcl/substrate --pattern 'substrate*.tar.gz'
+sudo tar xzf substrate*.tar.gz -C /usr/local/bin
 ```
 
 Here’s a one-liner via [`yoink`](https://github.com/mxcl/yoink):
 
 ```sh
-sh <(curl -fsSL https://yoink.sh) --stream mxcl/the-package-managinat0r | sudo tar -xzC /usr/local/bin
+sh <(curl -fsSL https://yoink.sh) --stream mxcl/substrate | sudo tar -xzC /usr/local/bin
 ```
 
 ## Overview
@@ -31,47 +32,48 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/the-package-managinat0r | sudo t
 - Dependencies of Homebrew packages are installed alongside, ie. a self
   contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
-- `p0r run PKG` can run anything ephemerally (downloads fresh every time)
+- `ss run PKG` can run anything ephemerally (downloads fresh every time)
 - Agent focused, eg. we package `qmd` and support npm installs like
   `npm:openclaw`
 
 ## Usage
 
 ```sh
-$ p0r run zopflipng in.png out.png  # alias: x
+$ ss run zopflipng in.png out.png  # alias: x
 ## ^^ emphermeral; downloads fresh every time
 
-$ sudo p0r install npm:openclaw
+$ sudo ss install npm:openclaw
 /usr/local/bin/openclaw
 # ^^ humans don’t let Claws modify themselves
 
-$ sudo p0r uninstall npm:openclaw  # alias: rm
+$ sudo ss uninstall npm:openclaw  # alias: rm
 
-$ p0r list  # alias: ls
+$ ss list  # alias: ls
 
-$ p0r outdated
+$ ss outdated
 
-$ sudo p0r update  # alias: up
+$ sudo ss update  # alias: up
 ```
 
 ## Is This Ready For Me?
 
-No. Do not use this as a replacement for Homebrew. I whipped it up in a few
-days. Homebrew is 16 years old.
+Look: I’m using it. But I’m also the one who made it.
 
-## But I Wanna!
+I'm going to be honest with you. Substrate does some *mad tricks* to make
+Homebrew bottles relocatable. There *will definitely be some issues*.
 
-That’s fine. I like it. I think it's good. Maybe you will too.
+OTOH maybe that excites you? You’re the type who wants to get involved in
+that?
 
 ## Caveats
 
-- `p0r run` is ephemeral. It always downloads and it always downloads the
-  latest version unless you specify, eg. `p0r run zopflipng@1.0.3 …`
+- `ss run` is ephemeral. It always downloads and it always downloads the
+  latest version unless you specify, eg. `ss run zopflipng@1.0.3 …`
   > This is a feature. We are operating in an agentic world where agents
   > can literally modify binaries if they want to be malicious. Everything
   > must be installed by a human and if not then the tool that is installed
   > by root that is executing things should never trust a user-writable cache
-- there is no `p0r services` command. Use `brew`.
+- there is no `ss services` command. Use `brew`.
 - some Homebrew formulae are not supported. If you come across them, report
   this as a bug.
 - We do not and will likely never support casks.
@@ -84,7 +86,7 @@ That’s fine. I like it. I think it's good. Maybe you will too.
   entities that are not even human. Best we secure things better now.
 - However, I want agents to be able to run anythiing they need without it
   messing with the rest of the system.
-- Hence `p0r run` executes in a sandbox that can only be configured by the
+- Hence `ss run` executes in a sandbox that can only be configured by the
   root user. If you run it without configuring it first it can only write to
   `/tmp`
 - I trust Vendors *the most* to maintain their own packages.
@@ -97,6 +99,6 @@ That’s fine. I like it. I think it's good. Maybe you will too.
 - For Homebrew packages we rewrite `/opt/homebrew/` in the binaries and any
   text files.
   - Indeed this may prove stupid and/or flakey
-  - Indeed we do not recommend you depend on `p0r` in any substantial way
+  - Indeed we do not recommend you depend on `ss` in any substantial way
 - We are overzealously rejecting any Homebrew packages with pre or post
   install steps at this time.
