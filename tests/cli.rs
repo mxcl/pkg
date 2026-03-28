@@ -32,7 +32,7 @@ fn pkg_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
 
     let output = run_pkg(&["help", "x"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg use"));
+    assert!(stdout(&output).contains("Usage: pkg run"));
 
     let output = run_pkg(&["help", "update"]);
     assert!(output.status.success());
@@ -46,6 +46,8 @@ fn pkg_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
 #[test]
 fn pkg_subcommand_parsing_covers_help_version_and_non_root_failures() {
     let cases = [
+        (vec!["run", "--help"], true, "Usage: pkg run"),
+        (vec!["run", "--version"], true, "pkg run 0.3.0"),
         (vec!["x", "--help"], true, "Usage: pkg x"),
         (vec!["x", "--version"], true, "pkg x 0.3.0"),
         (vec!["i", "--help"], true, "Usage: pkg i"),
@@ -69,6 +71,11 @@ fn pkg_subcommand_parsing_covers_help_version_and_non_root_failures() {
     let output = run_pkg(&["x"]);
     assert!(!output.status.success());
     assert!(stdout(&output).contains("Usage: pkg x"));
+    assert!(stderr(&output).contains("pkg: missing executable name"));
+
+    let output = run_pkg(&["run"]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("Usage: pkg run"));
     assert!(stderr(&output).contains("pkg: missing executable name"));
 
     let output = run_pkg(&["x", "+ripgrep", "+pcre2", "rg"]);

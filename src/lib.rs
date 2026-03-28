@@ -413,7 +413,7 @@ impl Invocation {
 impl Mode {
     fn from_name(name: &str) -> Option<Self> {
         match name {
-            "x" | "use" => Some(Self::X),
+            "x" | "run" | "use" => Some(Self::X),
             "i" | "install" => Some(Self::I),
             _ => None,
         }
@@ -421,7 +421,7 @@ impl Mode {
 
     fn canonical_name(self) -> &'static str {
         match self {
-            Self::X => "use",
+            Self::X => "run",
             Self::I => "install",
         }
     }
@@ -2875,7 +2875,7 @@ fn print_pkg_usage(program: &str) {
     println!("Usage: {program} <subcommand> [args...]");
     println!();
     println!("Subcommands:");
-    println!("  use, x       Run Homebrew executables ephemerally.");
+    println!("  run, x       Run Homebrew executables ephemerally.");
     println!("  install, i   Install a self-contained package.");
     println!("  list, ls     List installed packages with their versions.");
     println!("  outdated     List installed packages with updates available.");
@@ -4912,6 +4912,7 @@ package or `bar` for the package that provides the `foo` executable"
 
     #[test]
     fn mode_from_name_accepts_subcommands_and_aliases() {
+        assert_eq!(Mode::from_name("run"), Some(Mode::X));
         assert_eq!(Mode::from_name("use"), Some(Mode::X));
         assert_eq!(Mode::from_name("x"), Some(Mode::X));
         assert_eq!(Mode::from_name("install"), Some(Mode::I));
@@ -4926,9 +4927,12 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(pkg.name, "pkg");
         assert_eq!(pkg.mode, None);
 
+        let run_invocation = Invocation::from_program(&OsString::from("run"));
+        assert_eq!(run_invocation.binary_name, "run");
+        assert_eq!(run_invocation.name, "run");
+        assert_eq!(run_invocation.mode, Some(Mode::X));
+
         let use_invocation = Invocation::from_program(&OsString::from("use"));
-        assert_eq!(use_invocation.binary_name, "use");
-        assert_eq!(use_invocation.name, "use");
         assert_eq!(use_invocation.mode, Some(Mode::X));
 
         let x_invocation = Invocation::from_program(&OsString::from("x"));

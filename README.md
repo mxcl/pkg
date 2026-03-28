@@ -29,17 +29,18 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/pkg | sudo tar -xzC /usr/local/b
 - Dependencies of Homebrew packages are installed alongside, ie. a self
   contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
-- `pkg use PKG` can run anything ephemerally (downloads fresh every time)
+- `pkg run PKG` can run anything ephemerally (downloads fresh every time)
 - Agent focused, eg. we package openclaw, clawhub and `qmd`
 
 ## Usage
 
 ```sh
-$ pkg use zopflipng in.png out.png
+$ pkg run zopflipng in.png out.png  # alias: x
+## ^^ emphermeral; downloads fresh every time
 
 $ sudo pkg install openclaw
 /usr/local/bin/openclaw
-# Humans don’t let Claws modify themselves
+# ^^ humans don’t let Claws modify themselves
 
 $ sudo pkg uninstall openclaw  # alias: rm
 
@@ -47,7 +48,7 @@ $ pkg list  # alias: ls
 
 $ pkg outdated
 
-$ sudo pkg update
+$ sudo pkg update  # alias: up
 ```
 
 ## Is This Ready For Me?
@@ -62,20 +63,20 @@ That’s fine. I like it. I think it's good. Maybe you will too.
 ## Caveats
 
 - Mostly we are not going to package things from eg. `npm`, so you will need
-  to `pkg use npx`.
+  to `pkg run npx`.
   > [!NOTE]
   > Having said this; We recommend that you not `npm install -g` anything:
   > `npm` is not a package manager: it’s a dependency manager.
 - We make exceptions arbitarily
   - eg. OpenClaw is a special case because we do not think it’s a great idea
     to let OpenClaw modify.
-- `pkg use` always does an update check unless you run with a specific
-  version, eg. `pkg use zopflipng@1.0.3 …`
+- `pkg run` always does an update check unless you run with a specific
+  version, eg. `pkg run zopflipng@1.0.3 …`
   - notably `npx` does not behave this way and requires eg. `npx foo@latest`
     but we do not have the same scope—all our packages are ephemeral
 - Homebrew formula with:
-  - `post_install` steps are not supported via `pkg install` or `pkg use`
-  - `pre_install` steps are not supported via `pkg install` or `pkg use`
+  - `post_install` steps are not supported via `pkg install` or `pkg run`
+  - `pre_install` steps are not supported via `pkg install` or `pkg run`
   We may figure out how to support these. But for now we’re just not going to
   do this because we assume we will screw it up.
 - `service` metadata does not block installs, but `pkg` does not manage
@@ -96,7 +97,7 @@ That’s fine. I like it. I think it's good. Maybe you will too.
   entities that are not even human. Best we secure things better now.
 - However, I want agents to be able to run anythiing they need without it
   messing with the rest of the system.
-- Hence `pkg use` executes in a sandbox that can only be configured by the
+- Hence `pkg run` executes in a sandbox that can only be configured by the
   root user. If you run it without configuring it first it can only write to
   `/tmp/pkg`
 - I trust Vendors *the most* to maintain their own packages.
