@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -78,6 +78,7 @@ const HOMEBREW_REPOSITORY_PLACEHOLDER: &str = "@@HOMEBREW_REPOSITORY@@";
 const HOMEBREW_LIBRARY_PLACEHOLDER: &str = "@@HOMEBREW_LIBRARY@@";
 const HOMEBREW_PERL_PLACEHOLDER: &str = "@@HOMEBREW_PERL@@";
 const HOMEBREW_JAVA_PLACEHOLDER: &str = "@@HOMEBREW_JAVA@@";
+const SYSTEM_TMP_ROOT: &str = "/tmp";
 const OPENSSL_CA_CERTIFICATES_DIR: &str = "share/ca-certificates";
 const OPENSSL_CA_CERTIFICATES_CERT: &str = "share/ca-certificates/cacert.pem";
 const OPENSSL_CERT_PEM_PATH: &str = "/etc/openssl@3/cert.pem";
@@ -92,6 +93,7 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
     b"@@HOMEBREW_JAVA@@",
 ];
 const TMP_X_ROOT: &str = "/tmp/x";
+const TMP_TOOL_ROOT: &str = "/tmp/pkgtool";
 const OPT_PKG_ROOT: &str = "/opt";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
 #[cfg(feature = "gold-release")]
@@ -425,7 +427,11 @@ impl InstallPlan {
             root_formula,
             stable_root: stable_root.clone(),
             install_root: stable_root,
-            tmp_root: PathBuf::from(TMP_X_ROOT).join(".tmp"),
+            tmp_root: temp_root_for_target_root(
+                Path::new(TMP_X_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            ),
         }
     }
 
@@ -438,7 +444,11 @@ impl InstallPlan {
             root_formula,
             stable_root,
             install_root,
-            tmp_root: PathBuf::from(OPT_PKG_ROOT).join(".tmp"),
+            tmp_root: temp_root_for_target_root(
+                Path::new(OPT_PKG_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            ),
         }
     }
 
@@ -481,6 +491,34 @@ impl InstallPlan {
     fn root_executables_manifest_path(&self) -> PathBuf {
         self.install_root.join(ROOT_EXECUTABLES_MANIFEST)
     }
+}
+
+fn temp_root_for_target_root(
+    target_root: &Path,
+    system_tmp_root: &Path,
+    shared_tmp_root: &Path,
+) -> PathBuf {
+    match paths_share_device(target_root, system_tmp_root) {
+        Ok(true) => shared_tmp_root.to_path_buf(),
+        Ok(false) | Err(_) => target_root.join(".tmp"),
+    }
+}
+
+fn paths_share_device(left: &Path, right: &Path) -> Result<bool, String> {
+    Ok(device_id(left)? == device_id(right)?)
+}
+
+fn device_id(path: &Path) -> Result<u64, String> {
+    let metadata_path = metadata_probe_path(path)?;
+    let metadata = fs::metadata(metadata_path)
+        .map_err(|err| format!("failed to stat {}: {err}", metadata_path.display()))?;
+    Ok(metadata.dev())
+}
+
+fn metadata_probe_path(path: &Path) -> Result<&Path, String> {
+    path.ancestors()
+        .find(|ancestor| ancestor.exists())
+        .ok_or_else(|| format!("no existing ancestor for {}", path.display()))
 }
 
 fn prepare_i_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, Option<TempDir>), String> {
@@ -6535,12 +6573,61 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
-    fn install_plan_for_i_uses_opt_root() {
+    fn temp_root_for_target_root_prefers_shared_tmp_root_on_same_device() {
+        let temp = TempDir::new().unwrap();
+        let target_root = temp.path().join("opt");
+        let system_tmp_root = temp.path().join("tmp");
+        let shared_tmp_root = temp.path().join("pkgtool");
+
+        assert_eq!(
+            temp_root_for_target_root(&target_root, &system_tmp_root, &shared_tmp_root),
+            shared_tmp_root
+        );
+    }
+
+    #[test]
+    fn temp_root_for_target_root_falls_back_when_target_root_has_no_existing_ancestor() {
+        let temp = TempDir::new().unwrap();
+        let target_root = PathBuf::from("relative/opt");
+        let system_tmp_root = temp.path().join("tmp");
+        let shared_tmp_root = temp.path().join("pkgtool");
+
+        assert_eq!(
+            temp_root_for_target_root(&target_root, &system_tmp_root, &shared_tmp_root),
+            target_root.join(".tmp")
+        );
+    }
+
+    #[test]
+    fn install_plan_for_i_uses_detected_tmp_root() {
         let plan = InstallPlan::for_i("caddy".to_string(), "caddy".to_string());
 
         assert_eq!(plan.stable_root, PathBuf::from("/opt/caddy"));
         assert_eq!(plan.install_root, PathBuf::from("/opt/caddy"));
-        assert_eq!(plan.tmp_root, PathBuf::from("/opt/.tmp"));
+        assert_eq!(
+            plan.tmp_root,
+            temp_root_for_target_root(
+                Path::new(OPT_PKG_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            )
+        );
+    }
+
+    #[test]
+    fn install_plan_for_x_uses_detected_tmp_root() {
+        let plan = InstallPlan::for_x("caddy".to_string());
+
+        assert_eq!(plan.stable_root, PathBuf::from("/tmp/x/caddy"));
+        assert_eq!(plan.install_root, PathBuf::from("/tmp/x/caddy"));
+        assert_eq!(
+            plan.tmp_root,
+            temp_root_for_target_root(
+                Path::new(TMP_X_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            )
+        );
     }
 
     fn fake_vendor_version() -> Result<semver::Version, String> {
