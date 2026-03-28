@@ -59,8 +59,7 @@ pub fn github_release_url(repo: &str, tag: &str, asset: &str) -> String {
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 fn github_api_root() -> String {
-    std::env::var("PKG_GITHUB_API_ROOT")
-        .unwrap_or_else(|_| "https://api.github.com".to_string())
+    std::env::var("PKG_GITHUB_API_ROOT").unwrap_or_else(|_| "https://api.github.com".to_string())
 }
 
 fn npm_registry_root() -> String {
@@ -92,11 +91,7 @@ pub fn github_latest_tag(repo: &str) -> Result<String, String> {
 }
 
 pub fn npm_latest_tag(package: &str) -> Result<String, String> {
-    let url = format!(
-        "{}/{}",
-        npm_registry_root(),
-        urlencoding::encode(package)
-    );
+    let url = format!("{}/{}", npm_registry_root(), urlencoding::encode(package));
     let package: NpmPackageVersion =
         fetch_json(&url, &format!("failed to fetch npm metadata for {package}"))?;
     Ok(package.dist_tags.latest)

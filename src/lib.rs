@@ -4,8 +4,11 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
+#[cfg(feature = "gold-release")]
 use std::os::unix::process::CommandExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -18,7 +21,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
-use tempfile::TempDir;
+use tempfile::{Builder, TempDir};
 use ureq::Error as UreqError;
 use walkdir::WalkDir;
 
@@ -95,6 +98,7 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
 const TMP_X_ROOT: &str = "/tmp/x";
 const TMP_TOOL_ROOT: &str = "/tmp/pkgtool";
 const OPT_PKG_ROOT: &str = "/opt";
+const PKG_STATE_LOCK: &str = ".pkg.lock";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
 #[cfg(feature = "gold-release")]
 const SELF_UPDATE_TARGET: &str = "/usr/local/bin/pkg";
@@ -370,6 +374,10 @@ struct LoggedCommandOutput {
     lines: Vec<String>,
 }
 
+struct PackageMutationLock {
+    file: File,
+}
+
 pub fn main_entry() {
     let mut args = env::args_os();
     let program = args.next().unwrap_or_else(|| OsString::from("pkg"));
@@ -558,6 +566,69 @@ fn prepare_i_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, Option<Tem
     Ok((staged_plan, Some(workspace)))
 }
 
+fn prepare_x_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, TempDir), String> {
+    debug_assert_eq!(plan.mode, Mode::X);
+    let run_root = plan
+        .stable_root
+        .parent()
+        .ok_or_else(|| format!("invalid stable root {}", plan.stable_root.display()))?;
+    fs::create_dir_all(run_root)
+        .map_err(|err| format!("failed to create {}: {err}", run_root.display()))?;
+    fs::create_dir_all(&plan.tmp_root)
+        .map_err(|err| format!("failed to create {}: {err}", plan.tmp_root.display()))?;
+    let workspace = Builder::new()
+        .prefix(".")
+        .rand_bytes(6)
+        .tempdir_in(run_root)
+        .map_err(|err| {
+            format!(
+                "failed to create run workspace in {}: {err}",
+                run_root.display()
+            )
+        })?;
+    let install_root = workspace.path().to_path_buf();
+    let staged_plan = InstallPlan {
+        stable_root: install_root.clone(),
+        install_root,
+        ..plan.clone()
+    };
+    Ok((staged_plan, workspace))
+}
+
+fn acquire_package_mutation_lock() -> Result<PackageMutationLock, String> {
+    acquire_package_mutation_lock_at(Path::new(OPT_PKG_ROOT))
+}
+
+fn acquire_package_mutation_lock_at(root: &Path) -> Result<PackageMutationLock, String> {
+    fs::create_dir_all(root)
+        .map_err(|err| format!("failed to create {}: {err}", root.display()))?;
+    let path = root.join(PKG_STATE_LOCK);
+    let file = File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|err| format!("failed to open {}: {err}", path.display()))?;
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        return Err(format!(
+            "failed to lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(PackageMutationLock { file })
+}
+
+impl Drop for PackageMutationLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 impl PackageStatus {
     fn is_outdated(&self) -> bool {
         self.installed_version != self.latest_version
@@ -723,30 +794,47 @@ fn run_x(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
     let progress = InstallProgress::new(&plan.package_name);
 
     let result = (|| {
-        ensure_plan_parent_dirs(&plan)?;
-        let downloads = download_bottles(&graph, &plan.tmp_root, Some(&progress))?;
+        let (staged_plan, run_workspace) = prepare_x_install_plan(&plan)?;
+        ensure_plan_parent_dirs(&staged_plan)?;
+        let downloads = download_bottles(&graph, &staged_plan.tmp_root, Some(&progress))?;
         progress.begin_install_phase();
         let installs = inspect_keg_dirs(&graph, &downloads)?;
-        let rewrite_rules = build_rewrite_rules(&plan, &installs);
-        install_package(&config, &plan, &installs, &rewrite_rules, Some(&progress))?;
-        run_package_post_install(&plan, &installs, Path::new(USR_LOCAL_BIN))?;
+        let rewrite_rules = build_rewrite_rules(&staged_plan, &installs);
+        install_package(
+            &config,
+            &staged_plan,
+            &installs,
+            &rewrite_rules,
+            Some(&progress),
+        )?;
+        run_package_post_install(&staged_plan, &installs, Path::new(USR_LOCAL_BIN))?;
 
-        find_executable_in_package(&plan, &graph, &request.tool).ok_or_else(|| {
-            format!(
-                "'{}' not found in package {}",
-                request.tool, plan.package_name
-            )
-        })
+        let exec_path = find_executable_in_package(&staged_plan, &graph, &request.tool)
+            .ok_or_else(|| {
+                format!(
+                    "'{}' not found in package {}",
+                    request.tool, staged_plan.package_name
+                )
+            })?;
+        Ok((
+            exec_path,
+            build_exec_path_entries(&staged_plan, &graph),
+            run_workspace,
+        ))
     })();
 
     match result {
-        Ok(exec_path) => {
+        Ok((exec_path, env_entries, run_workspace)) => {
             progress.clear();
-            exec_tool(
-                exec_path,
-                &request.tool_args,
-                &build_exec_path_entries(&plan, &graph),
-            );
+            let status = match run_tool(&exec_path, &request.tool_args, &env_entries) {
+                Ok(status) => status,
+                Err(err) => {
+                    drop(run_workspace);
+                    return Err(err);
+                }
+            };
+            drop(run_workspace);
+            process::exit(exit_code_from_status(status));
         }
         Err(err) => {
             progress.clear();
@@ -765,6 +853,7 @@ fn run_i(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
         return Err("must be run as root".to_string());
     }
 
+    let _lock = acquire_package_mutation_lock()?;
     let config = load_config()?;
     for package in request.packages {
         run_i_package(&config, package, request.force)?;
@@ -874,12 +963,13 @@ fn run_uninstall(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), S
         None => return Ok(()),
     };
 
-    for package in &request.packages {
-        ensure_package_installed(Path::new(OPT_PKG_ROOT), package)?;
-    }
-
     if !is_root() {
         return Err("must be run as root".to_string());
+    }
+
+    let _lock = acquire_package_mutation_lock()?;
+    for package in &request.packages {
+        ensure_package_installed(Path::new(OPT_PKG_ROOT), package)?;
     }
 
     for package in request.packages {
@@ -916,6 +1006,7 @@ fn run_update(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), Stri
 
     maybe_self_update_and_restart(&request)?;
 
+    let _lock = acquire_package_mutation_lock()?;
     let config = load_config()?;
     for package in resolve_outdated_package_statuses(&config, &request.selection)? {
         run_i_package(&config, requested_package_from_status(&package), true)?;
@@ -2859,7 +2950,7 @@ fn shell_double_quote_escape(value: &str) -> String {
 fn print_x_usage(program: &str) {
     println!("Usage: {program} [-! | --shebang] [+formula] <executable> [args...]");
     println!();
-    println!("Runs Homebrew executables ephemerally from {TMP_X_ROOT}.");
+    println!("Runs Homebrew executables ephemerally from a fresh temp dir.");
 }
 
 fn print_i_usage(program: &str) {
@@ -4630,13 +4721,24 @@ fn is_executable(path: &Path) -> bool {
     }
 }
 
-fn exec_tool<T: AsRef<OsStr>>(tool: T, args: &[OsString], env_entries: &[PathBuf]) -> ! {
+fn run_tool<T: AsRef<OsStr>>(
+    tool: T,
+    args: &[OsString],
+    env_entries: &[PathBuf],
+) -> Result<ExitStatus, String> {
+    let tool = tool.as_ref();
     let mut cmd = Command::new(tool);
     cmd.args(args);
     cmd.env("PATH", build_exec_path(env_entries));
-    let err = cmd.exec();
-    eprintln!("failed to exec: {err}");
-    process::exit(1);
+    cmd.status()
+        .map_err(|err| format!("failed to run {}: {err}", Path::new(tool).display()))
+}
+
+fn exit_code_from_status(status: ExitStatus) -> i32 {
+    status
+        .code()
+        .or_else(|| status.signal().map(|signal| 128 + signal))
+        .unwrap_or(1)
 }
 
 fn build_exec_path(entries: &[PathBuf]) -> OsString {
@@ -4782,8 +4884,7 @@ fn is_root() -> bool {
 mod tests {
     use super::*;
     use crate::vendor::{
-        bun, clawhub, codex, deno, get, gh, github_release_url, node, openclaw, parse_semver,
-        qmd,
+        bun, clawhub, codex, deno, get, gh, github_release_url, node, openclaw, parse_semver, qmd,
     };
     use semver::Version;
 
@@ -6798,6 +6899,27 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn prepare_x_install_plan_uses_unique_unpredictable_workspace() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::X,
+            package_name: "caddy".to_string(),
+            root_formula: "caddy".to_string(),
+            stable_root: temp.path().join("x/caddy"),
+            install_root: temp.path().join("x/caddy"),
+            tmp_root: temp.path().join("x/.tmp"),
+        };
+
+        let (first_plan, _first_workspace) = prepare_x_install_plan(&plan).unwrap();
+        let (second_plan, _second_workspace) = prepare_x_install_plan(&plan).unwrap();
+
+        assert_ne!(first_plan.stable_root, plan.stable_root);
+        assert_eq!(first_plan.stable_root, first_plan.install_root);
+        assert!(first_plan.install_root.starts_with(temp.path().join("x")));
+        assert_ne!(first_plan.install_root, second_plan.install_root);
+    }
+
+    #[test]
     fn activate_install_replaces_existing_root_with_staged_tree() {
         let temp = TempDir::new().unwrap();
         let stable_root = temp.path().join("opt/caddy");
@@ -6911,12 +7033,18 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             plan.stable_target_dir("pcre2"),
             PathBuf::from("/tmp/x/rg/pkgs/pcre2")
         );
-        assert_eq!(plan.receipt_path("rg"), PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json"));
+        assert_eq!(
+            plan.receipt_path("rg"),
+            PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json")
+        );
         assert_eq!(
             plan.receipt_path("pcre2"),
             PathBuf::from("/tmp/x/rg/pkgs/pcre2/.pkg/receipt.json")
         );
-        assert_eq!(plan.package_manifest_path(), PathBuf::from("/tmp/x/rg/.pkg/stubs.json"));
+        assert_eq!(
+            plan.package_manifest_path(),
+            PathBuf::from("/tmp/x/rg/.pkg/stubs.json")
+        );
         assert_eq!(
             plan.root_receipt_path(),
             PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json")
@@ -6934,6 +7062,27 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert_eq!(metadata_probe_path(&nested).unwrap(), temp.path());
         assert!(paths_share_device(temp.path(), &nested).unwrap());
+    }
+
+    #[test]
+    fn acquire_package_mutation_lock_uses_flock() {
+        let temp = TempDir::new().unwrap();
+        let lock = acquire_package_mutation_lock_at(temp.path()).unwrap();
+        let path = temp.path().join(PKG_STATE_LOCK);
+        let second = File::options().read(true).write(true).open(&path).unwrap();
+
+        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1);
+        let err = std::io::Error::last_os_error().raw_os_error().unwrap();
+        assert!(err == libc::EWOULDBLOCK || err == libc::EAGAIN);
+
+        drop(lock);
+
+        let result = unsafe { libc::flock(second.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, 0);
+        unsafe {
+            libc::flock(second.as_raw_fd(), libc::LOCK_UN);
+        }
     }
 
     #[test]
@@ -6961,15 +7110,16 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     fn parse_x_request_supports_help_version_and_shebang_mode() {
         let invocation = Invocation::for_subcommand("pkg", "x", Mode::X);
 
-        assert!(parse_x_request_from_iter(&invocation, vec![OsString::from("--help")].into_iter())
-            .unwrap()
-            .is_none());
-        assert!(parse_x_request_from_iter(
-            &invocation,
-            vec![OsString::from("--version")].into_iter(),
-        )
-        .unwrap()
-        .is_none());
+        assert!(
+            parse_x_request_from_iter(&invocation, vec![OsString::from("--help")].into_iter())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            parse_x_request_from_iter(&invocation, vec![OsString::from("--version")].into_iter(),)
+                .unwrap()
+                .is_none()
+        );
 
         let request = parse_x_request_from_iter(
             &invocation,
@@ -7035,8 +7185,11 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             None
         );
         assert_eq!(
-            parse_uninstall_request_from_iter(&invocation, vec![OsString::from("--help")].into_iter())
-                .unwrap(),
+            parse_uninstall_request_from_iter(
+                &invocation,
+                vec![OsString::from("--help")].into_iter()
+            )
+            .unwrap(),
             None
         );
         assert_eq!(
@@ -7065,7 +7218,9 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert!(is_force_flag(&OsString::from("--force")));
         assert!(is_shebang_flag(&OsString::from("-!")));
         assert!(is_shebang_flag(&OsString::from("--shebang")));
-        assert!(is_no_self_update_flag(&OsString::from(SELF_UPDATE_DISABLE_FLAG)));
+        assert!(is_no_self_update_flag(&OsString::from(
+            SELF_UPDATE_DISABLE_FLAG
+        )));
         assert!(is_uninstall_subcommand("rm"));
         assert!(is_uninstall_subcommand("uninstall"));
         assert!(is_outdated_subcommand("outdated"));
@@ -7285,7 +7440,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
                 "python3".to_string(),
             ]
         );
-        assert_eq!(fs::read_link(bin_dir.join("python3")).unwrap(), bin_dir.join("python3.12"));
+        assert_eq!(
+            fs::read_link(bin_dir.join("python3")).unwrap(),
+            bin_dir.join("python3.12")
+        );
 
         let openssl_prefix = temp.path().join("openssl");
         let source_dir = openssl_prefix.join(OPENSSL_CA_CERTIFICATES_DIR);
@@ -7461,7 +7619,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         .unwrap();
         server.join().unwrap();
         assert_eq!(
-            specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            specs
+                .iter()
+                .map(|spec| spec.name.as_str())
+                .collect::<Vec<_>>(),
             vec!["openssl@3", "python@3.12"]
         );
     }
@@ -7512,13 +7673,22 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         ]);
 
         assert_eq!(bun::version().unwrap(), Version::parse("1.2.3").unwrap());
-        assert_eq!(codex::version().unwrap(), Version::parse("0.116.0").unwrap());
+        assert_eq!(
+            codex::version().unwrap(),
+            Version::parse("0.116.0").unwrap()
+        );
         assert_eq!(deno::version().unwrap(), Version::parse("2.7.7").unwrap());
         assert_eq!(gh::version().unwrap(), Version::parse("2.88.1").unwrap());
         assert_eq!(node::version().unwrap(), Version::parse("22.18.0").unwrap());
         assert_eq!(qmd::version().unwrap(), Version::parse("0.1.0").unwrap());
-        assert_eq!(clawhub::version().unwrap(), Version::parse("1.2.3").unwrap());
-        assert_eq!(openclaw::version().unwrap(), Version::parse("4.5.6").unwrap());
+        assert_eq!(
+            clawhub::version().unwrap(),
+            Version::parse("1.2.3").unwrap()
+        );
+        assert_eq!(
+            openclaw::version().unwrap(),
+            Version::parse("4.5.6").unwrap()
+        );
         server.join().unwrap();
     }
 
@@ -7557,24 +7727,19 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         let vendor_archive = temp.path().join("vendor.tar.gz");
         write_test_archive(
             &vendor_archive,
-            &[("pkg/bin/tool", b"#!/bin/sh\n"), ("pkg/share/doc.txt", b"hello\n")],
+            &[
+                ("pkg/bin/tool", b"#!/bin/sh\n"),
+                ("pkg/share/doc.txt", b"hello\n"),
+            ],
         );
         let vendor_bytes = fs::read(&vendor_archive).unwrap();
-        let (vendor_base, vendor_server) = start_test_http_server(
-            vec![("/vendor.tar.gz".to_string(), vendor_bytes)],
-            2,
-        );
+        let (vendor_base, vendor_server) =
+            start_test_http_server(vec![("/vendor.tar.gz".to_string(), vendor_bytes)], 2);
 
         let copy_file_version = Version::parse("9.8.7").unwrap();
-        register_test_download_url(
-            &copy_file_version,
-            format!("{vendor_base}/vendor.tar.gz"),
-        );
+        register_test_download_url(&copy_file_version, format!("{vendor_base}/vendor.tar.gz"));
         let copy_tree_version = Version::parse("9.8.8").unwrap();
-        register_test_download_url(
-            &copy_tree_version,
-            format!("{vendor_base}/vendor.tar.gz"),
-        );
+        register_test_download_url(&copy_tree_version, format!("{vendor_base}/vendor.tar.gz"));
 
         let plan = InstallPlan {
             mode: Mode::I,
@@ -7655,7 +7820,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             &archive,
             "sqlite",
             "3.49.1",
-            &[("bin/sqlite3", b"#!/bin/sh\n"), ("share/doc.txt", b"hello\n")],
+            &[
+                ("bin/sqlite3", b"#!/bin/sh\n"),
+                ("share/doc.txt", b"hello\n"),
+            ],
         );
         let install = InstalledFormula {
             spec: FormulaSpec {
@@ -7684,7 +7852,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert!(plan.install_root.join("bin/sqlite3").is_file());
         assert!(plan.install_root.join("share/doc.txt").is_file());
         assert!(package_is_current(&plan, &[install], &config.bottle_tag).unwrap());
-        assert_eq!(build_formula_order(&plan, &graph), vec!["sqlite".to_string()]);
+        assert_eq!(
+            build_formula_order(&plan, &graph),
+            vec!["sqlite".to_string()]
+        );
         assert_eq!(
             find_executable_in_package(&plan, &graph, "sqlite3").unwrap(),
             plan.install_root.join("bin/sqlite3")
@@ -7711,7 +7882,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             PathBuf::from("/opt/homebrew/opt/sqlite")
         );
         assert_eq!(
-            relative_path_from(Path::new("/opt/sqlite/bin"), Path::new("/opt/sqlite/share/doc")),
+            relative_path_from(
+                Path::new("/opt/sqlite/bin"),
+                Path::new("/opt/sqlite/share/doc")
+            ),
             PathBuf::from("../share/doc")
         );
         assert_eq!(
@@ -7727,14 +7901,18 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             Some("@@HOMEBREW_PREFIX@@/opt/sqlite/bin/sqlite3".to_string())
         );
         assert_eq!(
-            homebrew_relative_symlink_source(Path::new("/opt/homebrew/Cellar/sqlite/3.49.1/bin/sqlite3")),
+            homebrew_relative_symlink_source(Path::new(
+                "/opt/homebrew/Cellar/sqlite/3.49.1/bin/sqlite3"
+            )),
             Some("@@HOMEBREW_CELLAR@@/sqlite/3.49.1/bin/sqlite3".to_string())
         );
         assert!(!is_macho(b"abc"));
         assert!(codesign_if_macho(Path::new("/tmp/not-macho"), b"#!/bin/sh\n", None).is_ok());
 
         let mut command = Command::new("/bin/sh");
-        command.arg("-c").arg("printf 'hello\\n'; printf 'warn\\n' >&2");
+        command
+            .arg("-c")
+            .arg("printf 'hello\\n'; printf 'warn\\n' >&2");
         let output = run_command_with_logged_output(&mut command, None, "test command").unwrap();
         assert!(output.status.success());
         assert!(output.lines.iter().any(|line| line == "hello"));

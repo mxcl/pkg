@@ -65,7 +65,11 @@ fn pkg_subcommand_parsing_covers_help_version_and_non_root_failures() {
     for (args, success, needle) in cases {
         let output = run_pkg(&args);
         assert_eq!(output.status.success(), success, "{args:?}");
-        assert!(stdout(&output).contains(needle), "{args:?}: {}", stdout(&output));
+        assert!(
+            stdout(&output).contains(needle),
+            "{args:?}: {}",
+            stdout(&output)
+        );
     }
 
     let output = run_pkg(&["x"]);
