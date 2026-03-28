@@ -3984,7 +3984,11 @@ fn rewrite_binary(
             .unwrap_or(bytes.len());
         let segment = &bytes[start..end];
         if contains_relocatable_homebrew_reference_bytes(segment, rules) {
-            let rewritten = rewrite_binary_segment_bytes(segment, path, formula, rules)?;
+            let rewritten = if let Ok(original) = std::str::from_utf8(segment) {
+                rewrite_binary_segment(original, path, formula, rules)?.into_bytes()
+            } else {
+                rewrite_binary_segment_bytes(segment, path, formula, rules)?
+            };
             if rewritten.len() > segment.len() {
                 let original = String::from_utf8_lossy(segment);
                 let rewritten = String::from_utf8_lossy(&rewritten);
@@ -4036,6 +4040,24 @@ fn ensure_writable(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to make {} writable: {err}", path.display()))
 }
 
+fn rewrite_binary_segment(
+    segment: &str,
+    path: &Path,
+    formula: &str,
+    rules: &[RewriteRule],
+) -> Result<String, String> {
+    let mut rewritten = segment.to_string();
+    for rule in rules {
+        rewritten = rewrite_prefixes_in_text(&rewritten, rule);
+    }
+    if contains_relocatable_homebrew_reference_text(&rewritten, rules) {
+        return Err(unsupported_homebrew_rewrite_error(
+            "binary", formula, path, segment, &rewritten, rules,
+        ));
+    }
+    Ok(rewritten)
+}
+
 fn rewrite_binary_segment_bytes(
     segment: &[u8],
     path: &Path,
@@ -4070,7 +4092,7 @@ fn rewrite_binary_segment_bytes(
 
 fn rewrite_prefixes_in_bytes(segment: &[u8], rule: &RewriteRule) -> Vec<u8> {
     let source = rule.source.as_bytes();
-    let destination = rule.destination.as_bytes();
+    let destination = binary_rewrite_destination(rule);
     let mut output = Vec::with_capacity(segment.len());
     let mut cursor = 0usize;
     while let Some(offset) = find_subslice(&segment[cursor..], source) {
@@ -4082,7 +4104,7 @@ fn rewrite_prefixes_in_bytes(segment: &[u8], rule: &RewriteRule) -> Vec<u8> {
             .copied()
             .is_none_or(|byte| byte == b'/' || !is_path_byte(byte));
         if boundary {
-            output.extend_from_slice(destination);
+            output.extend_from_slice(&destination);
             cursor = suffix_index;
         } else {
             output.extend_from_slice(source);
@@ -4091,6 +4113,27 @@ fn rewrite_prefixes_in_bytes(segment: &[u8], rule: &RewriteRule) -> Vec<u8> {
     }
     output.extend_from_slice(&segment[cursor..]);
     output
+}
+
+fn binary_rewrite_destination(rule: &RewriteRule) -> Vec<u8> {
+    let source = rule.source.as_bytes();
+    let destination = rule.destination.as_bytes();
+    if destination.len() >= source.len() {
+        return destination.to_vec();
+    }
+
+    let Some(last_slash) = destination.iter().rposition(|byte| *byte == b'/') else {
+        return destination.to_vec();
+    };
+    if last_slash == 0 {
+        return destination.to_vec();
+    }
+
+    let mut padded = Vec::with_capacity(source.len());
+    padded.extend_from_slice(&destination[..=last_slash]);
+    padded.extend(std::iter::repeat_n(b'/', source.len() - destination.len()));
+    padded.extend_from_slice(&destination[last_slash + 1..]);
+    padded
 }
 
 fn unsupported_homebrew_rewrite_error(
@@ -5252,8 +5295,35 @@ package or `bar` for the package that provides the `foo` executable"
             rewrite_binary(&mut bytes, Path::new("/tmp/direnv"), "direnv", &rules).unwrap();
 
         assert!(changed);
-        assert!(find_subslice(&bytes, b"/opt/direnv/bin/bash").is_some());
+        assert!(find_subslice(&bytes, b"/opt////////////direnv/bin/bash").is_some());
         assert!(find_subslice(&bytes, b"/opt/homebrew/opt/bash/bin/bash").is_none());
+    }
+
+    #[test]
+    fn rewrite_binary_keeps_shorter_path_rewrites_nul_free() {
+        let plan = InstallPlan::for_i("direnv".to_string(), "direnv".to_string());
+        let installs = vec![InstalledFormula {
+            spec: FormulaSpec {
+                name: "bash".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/bash.tar.gz".to_string(),
+            },
+            keg_dir_name: "5.3.9".to_string(),
+            archive_path: PathBuf::from("/tmp/bash.tar.gz"),
+        }];
+        let rules = build_rewrite_rules(&plan, &installs);
+        let mut bytes = vec![0xff];
+        bytes.extend_from_slice(b"/opt/homebrew/opt/bash/bin/bash");
+        bytes.push(0x80);
+        bytes.push(0);
+
+        let changed =
+            rewrite_binary(&mut bytes, Path::new("/tmp/direnv"), "direnv", &rules).unwrap();
+
+        assert!(changed);
+        assert!(find_subslice(&bytes, b"/opt////////////direnv/bin/bash").is_some());
+        assert!(find_subslice(&bytes, b"/opt/direnv/bin/bash\0").is_none());
+        assert_eq!(*bytes.last().unwrap(), 0);
     }
 
     #[test]
