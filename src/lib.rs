@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -3984,14 +3984,10 @@ fn rewrite_binary(
             .unwrap_or(bytes.len());
         let segment = &bytes[start..end];
         if contains_relocatable_homebrew_reference_bytes(segment, rules) {
-            let original = std::str::from_utf8(segment).map_err(|err| {
-                format!(
-                    "{} contains a Homebrew path inside non-UTF-8 binary data; unsupported binary string format: {err}",
-                    path.display()
-                )
-            })?;
-            let rewritten = rewrite_binary_segment(original, path, formula, rules)?;
-            if rewritten.len() > original.len() {
+            let rewritten = rewrite_binary_segment_bytes(segment, path, formula, rules)?;
+            if rewritten.len() > segment.len() {
+                let original = String::from_utf8_lossy(segment);
+                let rewritten = String::from_utf8_lossy(&rewritten);
                 return Err(format!(
                     "{} cannot be rewritten safely because binary rewrite matched embedded Homebrew path {} and replacement {} is longer",
                     path.display(),
@@ -3999,7 +3995,7 @@ fn rewrite_binary(
                     rewritten
                 ));
             }
-            bytes[start..start + rewritten.len()].copy_from_slice(rewritten.as_bytes());
+            bytes[start..start + rewritten.len()].copy_from_slice(&rewritten);
             for byte in &mut bytes[start + rewritten.len()..end] {
                 *byte = 0;
             }
@@ -4040,22 +4036,61 @@ fn ensure_writable(path: &Path) -> Result<(), String> {
         .map_err(|err| format!("failed to make {} writable: {err}", path.display()))
 }
 
-fn rewrite_binary_segment(
-    segment: &str,
+fn rewrite_binary_segment_bytes(
+    segment: &[u8],
     path: &Path,
     formula: &str,
     rules: &[RewriteRule],
-) -> Result<String, String> {
-    let mut rewritten = segment.to_string();
+) -> Result<Vec<u8>, String> {
+    let mut rewritten = segment.to_vec();
     for rule in rules {
-        rewritten = rewrite_prefixes_in_text(&rewritten, rule);
+        rewritten = rewrite_prefixes_in_bytes(&rewritten, rule);
     }
-    if contains_relocatable_homebrew_reference_text(&rewritten, rules) {
-        return Err(unsupported_homebrew_rewrite_error(
-            "binary", formula, path, segment, &rewritten, rules,
+    if contains_relocatable_homebrew_reference_bytes(&rewritten, rules) {
+        if let (Ok(original), Ok(rewritten_text)) = (
+            std::str::from_utf8(segment),
+            std::str::from_utf8(&rewritten),
+        ) {
+            return Err(unsupported_homebrew_rewrite_error(
+                "binary",
+                formula,
+                path,
+                original,
+                rewritten_text,
+                rules,
+            ));
+        }
+        return Err(format!(
+            "formula {formula}: unsupported Homebrew path remains after binary rewrite in {}",
+            path.display()
         ));
     }
     Ok(rewritten)
+}
+
+fn rewrite_prefixes_in_bytes(segment: &[u8], rule: &RewriteRule) -> Vec<u8> {
+    let source = rule.source.as_bytes();
+    let destination = rule.destination.as_bytes();
+    let mut output = Vec::with_capacity(segment.len());
+    let mut cursor = 0usize;
+    while let Some(offset) = find_subslice(&segment[cursor..], source) {
+        let absolute = cursor + offset;
+        output.extend_from_slice(&segment[cursor..absolute]);
+        let suffix_index = absolute + source.len();
+        let boundary = segment
+            .get(suffix_index)
+            .copied()
+            .is_none_or(|byte| byte == b'/' || !is_path_byte(byte));
+        if boundary {
+            output.extend_from_slice(destination);
+            cursor = suffix_index;
+        } else {
+            output.extend_from_slice(source);
+            cursor = suffix_index;
+        }
+    }
+    output.extend_from_slice(&segment[cursor..]);
+    output
 }
 
 fn unsupported_homebrew_rewrite_error(
@@ -5196,6 +5231,32 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn rewrite_binary_rewrites_paths_inside_non_utf8_segments() {
+        let plan = InstallPlan::for_i("direnv".to_string(), "direnv".to_string());
+        let installs = vec![InstalledFormula {
+            spec: FormulaSpec {
+                name: "bash".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/bash.tar.gz".to_string(),
+            },
+            keg_dir_name: "5.3.9".to_string(),
+            archive_path: PathBuf::from("/tmp/bash.tar.gz"),
+        }];
+        let rules = build_rewrite_rules(&plan, &installs);
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend_from_slice(b"/opt/homebrew/opt/bash/bin/bash");
+        bytes.push(0x80);
+        bytes.push(0);
+
+        let changed =
+            rewrite_binary(&mut bytes, Path::new("/tmp/direnv"), "direnv", &rules).unwrap();
+
+        assert!(changed);
+        assert!(find_subslice(&bytes, b"/opt/direnv/bin/bash").is_some());
+        assert!(find_subslice(&bytes, b"/opt/homebrew/opt/bash/bin/bash").is_none());
+    }
+
+    #[test]
     fn rewrite_binary_error_includes_formula_and_rewrite_details() {
         let rules = vec![RewriteRule {
             source: "/opt/homebrew/Cellar/glow/2.1.0".to_string(),
@@ -5268,11 +5329,9 @@ package or `bar` for the package that provides the `foo` executable"
             rule.source == "/opt/homebrew/opt/glow" && rule.destination == "/tmp/x/glow"
         }));
         assert!(!rules.iter().any(|rule| rule.source.contains("/usr/local")));
-        assert!(
-            !rules
-                .iter()
-                .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew"))
-        );
+        assert!(!rules
+            .iter()
+            .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew")));
         assert!(rules.iter().any(|rule| {
             rule.source == HOMEBREW_PREFIX_PLACEHOLDER && rule.destination == "/tmp/x/glow"
         }));
