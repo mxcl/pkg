@@ -2155,7 +2155,8 @@ fn build_sandboxed_npm_install_command(
         .env("XDG_CACHE_HOME", &xdg_cache_home)
         .env("NPM_CONFIG_CACHE", &npm_cache)
         .env("NPM_CONFIG_USERCONFIG", &npm_userconfig)
-        .env("TMPDIR", tmp_root);
+        .env("TMPDIR", tmp_root)
+        .current_dir(sandbox_root.path());
     Ok(command)
 }
 
@@ -6055,6 +6056,7 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert_eq!(args[5], OsStr::new("--prefix"));
         assert_eq!(args[6], install_root.as_os_str());
         assert_eq!(args[7], OsStr::new("openclaw@1.2.3"));
+        assert_eq!(command.get_current_dir().unwrap(), sandbox_root.path());
 
         let envs: HashMap<_, _> = command
             .get_envs()
