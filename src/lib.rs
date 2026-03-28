@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -94,10 +94,10 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
 const TMP_X_ROOT: &str = "/tmp/x";
 const OPT_PKG_ROOT: &str = "/opt";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 const SELF_UPDATE_TARGET: &str = "/usr/local/bin/pkg";
 const SELF_UPDATE_DISABLE_FLAG: &str = "--no-self-update";
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 const SELF_UPDATE_REPO: &str = "mxcl/pkg";
 const ROOT_RECEIPT: &str = ".pkg/root-receipt.json";
 const RECEIPT: &str = ".pkg/receipt.json";
@@ -181,21 +181,21 @@ struct GhcrTokenResponse {
     token: String,
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 #[derive(Debug, Deserialize)]
 struct GithubRelease {
     tag_name: String,
     assets: Vec<GithubReleaseAsset>,
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 #[derive(Debug, Deserialize)]
 struct GithubReleaseAsset {
     name: String,
     browser_download_url: String,
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 #[derive(Debug)]
 struct SelfUpdateRelease {
     version: semver::Version,
@@ -1522,12 +1522,12 @@ fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
     }
 }
 
-#[cfg(not(feature = "self-update"))]
+#[cfg(not(feature = "gold-release"))]
 fn maybe_self_update_and_restart(_request: &UpdateRequest) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn maybe_self_update_and_restart(request: &UpdateRequest) -> Result<(), String> {
     if request.no_self_update || !running_from_self_update_target() {
         return Ok(());
@@ -1541,14 +1541,14 @@ fn maybe_self_update_and_restart(request: &UpdateRequest) -> Result<(), String> 
     exec_self_update_restart()
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn running_from_self_update_target() -> bool {
     env::current_exe()
         .ok()
         .is_some_and(|path| path == Path::new(SELF_UPDATE_TARGET))
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn resolve_self_update_release() -> Result<Option<SelfUpdateRelease>, String> {
     let release: GithubRelease = fetch_json(
         &format!("https://api.github.com/repos/{SELF_UPDATE_REPO}/releases/latest"),
@@ -1586,18 +1586,18 @@ fn resolve_self_update_release() -> Result<Option<SelfUpdateRelease>, String> {
     }))
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn parse_self_update_version(tag: &str) -> Result<semver::Version, String> {
     semver::Version::parse(tag.strip_prefix('v').unwrap_or(tag))
         .map_err(|err| format!("failed to parse release version {tag}: {err}"))
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn current_self_update_asset_name(version: &semver::Version) -> Option<String> {
     self_update_asset_name_for(version, env::consts::OS, env::consts::ARCH)
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn self_update_asset_name_for(version: &semver::Version, os: &str, arch: &str) -> Option<String> {
     let os = match os {
         "macos" => "Darwin",
@@ -1612,7 +1612,7 @@ fn self_update_asset_name_for(version: &semver::Version, os: &str, arch: &str) -
     Some(format!("pkg-{version}-{os}-{arch}.tar.gz"))
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn install_self_update(release: &SelfUpdateRelease) -> Result<(), String> {
     let target = Path::new(SELF_UPDATE_TARGET);
     let target_permissions = fs::metadata(target)
@@ -1645,7 +1645,7 @@ fn install_self_update(release: &SelfUpdateRelease) -> Result<(), String> {
     })
 }
 
-#[cfg(feature = "self-update")]
+#[cfg(feature = "gold-release")]
 fn exec_self_update_restart() -> Result<(), String> {
     let mut command = Command::new(SELF_UPDATE_TARGET);
     for arg in env::args_os().skip(1) {
@@ -5092,7 +5092,7 @@ package or `bar` for the package that provides the `foo` executable"
         );
     }
 
-    #[cfg(feature = "self-update")]
+    #[cfg(feature = "gold-release")]
     #[test]
     fn parse_self_update_version_strips_leading_v() {
         assert_eq!(
@@ -5101,7 +5101,7 @@ package or `bar` for the package that provides the `foo` executable"
         );
     }
 
-    #[cfg(feature = "self-update")]
+    #[cfg(feature = "gold-release")]
     #[test]
     fn self_update_asset_name_for_uses_release_naming() {
         let version = semver::Version::parse("0.1.0").unwrap();
@@ -5268,9 +5268,11 @@ package or `bar` for the package that provides the `foo` executable"
             rule.source == "/opt/homebrew/opt/glow" && rule.destination == "/tmp/x/glow"
         }));
         assert!(!rules.iter().any(|rule| rule.source.contains("/usr/local")));
-        assert!(!rules
-            .iter()
-            .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew")));
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew"))
+        );
         assert!(rules.iter().any(|rule| {
             rule.source == HOMEBREW_PREFIX_PLACEHOLDER && rule.destination == "/tmp/x/glow"
         }));

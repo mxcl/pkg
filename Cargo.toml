@@ -5,7 +5,7 @@ edition = "2024"
 autobins = false
 
 [features]
-self-update = []
+gold-release = []
 
 [[bin]]
 name = "pkg"
