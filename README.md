@@ -23,7 +23,8 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/the-package-managinat0r | sudo t
 
 - Installs as root (like the good ol’ days)
 - Installs Homebrew and vendor packages to `/opt/$PKGNAME`
-- Installs npm packages to `/opt/npm/$PKGNAME`
+- Installs npm and pip packages to `/opt/$ECOSYSTEM/$PKGNAME`
+- Understands what brew deps certain npm and pip packages need
 - Installs from vendor when possible
 - Installs Homebrew packages otherwise
 - Never touches `/opt/homebrew`
