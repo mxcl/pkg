@@ -3043,28 +3043,7 @@ fn build_pip_install_command(
 fn discover_pip_entrypoints(venv_root: &Path, package: &str) -> Result<Vec<String>, String> {
     let python = venv_root.join("bin/python");
     let mut command = Command::new(&python);
-    command.arg("-c").arg(
-        "import importlib.metadata as md, json, sys\n\
-def norm(value):\n\
-    out = []\n\
-    last_sep = False\n\
-    for ch in value.lower():\n\
-        if ch.isalnum():\n\
-            out.append(ch)\n\
-            last_sep = False\n\
-        elif ch in '-_.':\n\
-            if not last_sep:\n\
-                out.append('-')\n\
-                last_sep = True\n\
-    return ''.join(out).strip('-')\n\
-want = norm(sys.argv[1])\n\
-for dist in md.distributions():\n\
-    name = dist.metadata.get('Name')\n\
-    if name and norm(name) == want:\n\
-        print(json.dumps(sorted({ep.name for ep in dist.entry_points if ep.group in {'console_scripts', 'gui_scripts'}})))\n\
-        raise SystemExit(0)\n\
-print('[]')\n",
-    );
+    command.arg("-c").arg(pip_entrypoint_discovery_script());
     command.arg(package);
     let output = command
         .output()
@@ -3086,6 +3065,30 @@ print('[]')\n",
     entrypoints.sort();
     entrypoints.dedup();
     Ok(entrypoints)
+}
+
+fn pip_entrypoint_discovery_script() -> &'static str {
+    r#"import importlib.metadata as md, json, sys
+def norm(value):
+    out = []
+    last_sep = False
+    for ch in value.lower():
+        if ch.isalnum():
+            out.append(ch)
+            last_sep = False
+        elif ch in '-_.':
+            if not last_sep:
+                out.append('-')
+                last_sep = True
+    return ''.join(out).strip('-')
+want = norm(sys.argv[1])
+for dist in md.distributions():
+    name = dist.metadata.get('Name')
+    if name and norm(name) == want:
+        print(json.dumps(sorted({ep.name for ep in dist.entry_points if ep.group in {'console_scripts', 'gui_scripts'}})))
+        raise SystemExit(0)
+print('[]')
+"#
 }
 
 fn write_pip_entrypoint_stubs(
@@ -7496,6 +7499,14 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
                 OsStr::new("1")
             );
         }
+    }
+
+    #[test]
+    fn pip_entrypoint_discovery_script_has_indented_function_body() {
+        let script = pip_entrypoint_discovery_script();
+
+        assert!(script.contains("def norm(value):\n    out = []\n"));
+        assert!(script.contains("\nfor dist in md.distributions():\n"));
     }
 
     #[test]
