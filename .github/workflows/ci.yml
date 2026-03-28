@@ -29,3 +29,30 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --locked --lcov --output-path lcov.info
+
+      - name: Upload coverage to Coveralls
+        uses: coverallsapp/github-action@v2
+        with:
+          github-token: ${{ github.token }}
+          file: lcov.info
+          format: lcov
