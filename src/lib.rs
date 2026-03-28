@@ -773,7 +773,15 @@ fn run_i(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
 }
 
 fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> Result<(), String> {
-    ensure_installable_package(&requested_package_name(&requested), force)?;
+    let package_name = requested_package_name(&requested);
+    ensure_installable_package(&package_name, force)?;
+    if force {
+        remove_existing_package_install(
+            Path::new(OPT_PKG_ROOT),
+            &package_name,
+            Path::new(USR_LOCAL_BIN),
+        )?;
+    }
     match requested {
         RequestedPackage::Auto(package_name) => {
             if let Some(package) = vendor::get(&package_name) {
@@ -2405,16 +2413,12 @@ fn activate_install(plan: &InstallPlan) -> Result<(), String> {
 }
 
 fn uninstall_package(package_name: &str) -> Result<(), String> {
-    let install_root = PathBuf::from(OPT_PKG_ROOT).join(package_name);
     ensure_package_installed(Path::new(OPT_PKG_ROOT), package_name)?;
-
-    remove_package_stubs_from_bin(
+    remove_existing_package_install(
         Path::new(OPT_PKG_ROOT),
         package_name,
         Path::new(USR_LOCAL_BIN),
-    )?;
-    remove_path(&install_root)?;
-    refresh_post_uninstall_stubs(Path::new(OPT_PKG_ROOT), Path::new(USR_LOCAL_BIN))
+    )
 }
 
 fn ensure_package_installed(opt_root: &Path, package_name: &str) -> Result<(), String> {
@@ -2479,6 +2483,23 @@ fn remove_package_stubs_from_bin(
     }
 
     Ok(())
+}
+
+fn remove_existing_package_install(
+    opt_root: &Path,
+    package_name: &str,
+    bin_dir: &Path,
+) -> Result<(), String> {
+    let install_root = opt_root.join(package_name);
+    match fs::symlink_metadata(&install_root) {
+        Ok(_) => {
+            remove_package_stubs_from_bin(opt_root, package_name, bin_dir)?;
+            remove_path(&install_root)?;
+            refresh_post_uninstall_stubs(opt_root, bin_dir)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
+    }
 }
 
 fn collect_shared_stubs(
@@ -6529,6 +6550,34 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert!(bin_dir.join("python").exists());
         assert!(fs::symlink_metadata(bin_dir.join("python3.12")).is_ok());
         assert!(fs::symlink_metadata(bin_dir.join("python3.13")).is_err());
+    }
+
+    #[test]
+    fn remove_existing_package_install_removes_prefix_and_stubs() {
+        let temp = TempDir::new().unwrap();
+        let opt_root = temp.path().join("opt");
+        let bin_dir = temp.path().join("usr-local-bin");
+        let foo = opt_root.join("foo");
+
+        fs::create_dir_all(foo.join("bin")).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_stub_manifest(
+            &foo.join(STUB_MANIFEST),
+            &StubManifest {
+                stubs: vec!["foo".to_string(), "bar".to_string()],
+            },
+        )
+        .unwrap();
+
+        write_executable(&foo.join("bin/foo"));
+        write_executable(&bin_dir.join("foo"));
+        write_executable(&bin_dir.join("bar"));
+
+        remove_existing_package_install(&opt_root, "foo", &bin_dir).unwrap();
+
+        assert!(fs::symlink_metadata(&foo).is_err());
+        assert!(fs::symlink_metadata(bin_dir.join("foo")).is_err());
+        assert!(fs::symlink_metadata(bin_dir.join("bar")).is_err());
     }
 
     #[test]
