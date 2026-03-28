@@ -4,7 +4,7 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
-use std::os::unix::fs::{symlink, PermissionsExt};
+use std::os::unix::fs::{PermissionsExt, symlink};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitStatus, Stdio};
@@ -1078,11 +1078,6 @@ fn run_i_vendor(
             Err(err)
         }
     }
-}
-
-fn plan_tmp_root(package_name: &str) -> PathBuf {
-    let _ = package_name;
-    PathBuf::from(OPT_PKG_ROOT).join(".tmp")
 }
 
 fn parse_x_request(
@@ -2292,7 +2287,15 @@ fn ensure_package_installed(opt_root: &Path, package_name: &str) -> Result<(), S
 }
 
 fn ensure_installable_package(package_name: &str, force: bool) -> Result<(), String> {
-    let install_root = Path::new(OPT_PKG_ROOT).join(package_name);
+    ensure_installable_package_at(Path::new(OPT_PKG_ROOT), package_name, force)
+}
+
+fn ensure_installable_package_at(
+    opt_root: &Path,
+    package_name: &str,
+    force: bool,
+) -> Result<(), String> {
+    let install_root = opt_root.join(package_name);
     match fs::symlink_metadata(&install_root) {
         Ok(_) if force => Ok(()),
         Ok(_) => Err(format!(
@@ -4825,6 +4828,33 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_i_request_accepts_force_flag() {
+        let invocation = Invocation::for_subcommand("pkg", "i", Mode::I);
+        let request = parse_i_request_from_iter(
+            &invocation,
+            vec![
+                OsString::from("--force"),
+                OsString::from("cargo-binstall"),
+                OsString::from("-f"),
+                OsString::from("cargo-zigbuild"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(IRequest {
+                packages: vec![
+                    RequestedPackage::Auto("cargo-binstall".to_string()),
+                    RequestedPackage::Auto("cargo-zigbuild".to_string()),
+                ],
+                force: true,
+            })
+        );
+    }
+
+    #[test]
     fn parse_i_request_rejects_path_separator_in_any_package() {
         let invocation = Invocation::for_subcommand("pkg", "i", Mode::I);
         let request = parse_i_request_from_iter(
@@ -5455,9 +5485,11 @@ package or `bar` for the package that provides the `foo` executable"
             rule.source == "/opt/homebrew/opt/glow" && rule.destination == "/tmp/x/glow"
         }));
         assert!(!rules.iter().any(|rule| rule.source.contains("/usr/local")));
-        assert!(!rules
-            .iter()
-            .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew")));
+        assert!(
+            !rules
+                .iter()
+                .any(|rule| rule.source.contains("/home/linuxbrew/.linuxbrew"))
+        );
         assert!(rules.iter().any(|rule| {
             rule.source == HOMEBREW_PREFIX_PLACEHOLDER && rule.destination == "/tmp/x/glow"
         }));
@@ -6440,6 +6472,66 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         let script = fs::read_to_string(&stub_path).unwrap();
         assert!(script.contains("PATH=\"/opt/python@3.12/bin:/opt/tools/\\$special/bin:$PATH\"\n"));
         assert!(script.contains("exec '/opt/python@3.12/bin/python3' \"$@\"\n"));
+    }
+
+    #[test]
+    fn ensure_installable_package_requires_force_for_existing_install() {
+        let temp = TempDir::new().unwrap();
+        fs::create_dir_all(temp.path().join("already-installed")).unwrap();
+
+        let err =
+            ensure_installable_package_at(temp.path(), "already-installed", false).unwrap_err();
+
+        assert_eq!(
+            err,
+            "package already-installed is already installed; use --force/-f to reinstall"
+        );
+        ensure_installable_package_at(temp.path(), "already-installed", true).unwrap();
+        ensure_installable_package_at(temp.path(), "not-installed", false).unwrap();
+    }
+
+    #[test]
+    fn prepare_i_install_plan_stages_under_tmp_root() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "caddy".to_string(),
+            root_formula: "caddy".to_string(),
+            stable_root: temp.path().join("opt/caddy"),
+            install_root: temp.path().join("opt/caddy"),
+            tmp_root: temp.path().join("opt/.tmp"),
+        };
+
+        let (staged_plan, _workspace) = prepare_i_install_plan(&plan).unwrap();
+
+        assert_eq!(staged_plan.stable_root, plan.stable_root);
+        assert_ne!(staged_plan.install_root, plan.install_root);
+        assert!(staged_plan.install_root.starts_with(&plan.tmp_root));
+    }
+
+    #[test]
+    fn activate_install_replaces_existing_root_with_staged_tree() {
+        let temp = TempDir::new().unwrap();
+        let stable_root = temp.path().join("opt/caddy");
+        let install_root = temp.path().join("opt/.tmp/staged/install");
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "caddy".to_string(),
+            root_formula: "caddy".to_string(),
+            stable_root: stable_root.clone(),
+            install_root: install_root.clone(),
+            tmp_root: temp.path().join("opt/.tmp"),
+        };
+
+        fs::create_dir_all(stable_root.join("bin")).unwrap();
+        fs::write(stable_root.join("bin/caddy"), b"old").unwrap();
+        fs::create_dir_all(install_root.join("bin")).unwrap();
+        fs::write(install_root.join("bin/caddy"), b"new").unwrap();
+
+        activate_install(&plan).unwrap();
+
+        assert_eq!(fs::read(stable_root.join("bin/caddy")).unwrap(), b"new");
+        assert!(!install_root.exists());
     }
 
     #[test]
