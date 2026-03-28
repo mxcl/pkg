@@ -941,28 +941,41 @@ fn run_i(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
 
 fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> Result<(), String> {
     let package_name = requested_package_name(&requested);
-    ensure_installable_package(&package_name, force)?;
-    if force {
-        remove_existing_package_install(
-            Path::new(OPT_PKG_ROOT),
-            &package_name,
-            Path::new(USR_LOCAL_BIN),
-        )?;
-    }
-    match requested {
+    prepare_install_target(
+        Path::new(OPT_PKG_ROOT),
+        &package_name,
+        force,
+        Path::new(USR_LOCAL_BIN),
+    )?;
+    let result = match requested {
         RequestedPackage::Auto(package_name) => {
             if let Some(package) = vendor::get(&package_name) {
-                return run_i_vendor(config, package_name, package);
+                run_i_vendor(config, package_name.clone(), package)
+            } else {
+                let root_formula = resolve_i_root_formula(&package_name)?;
+                run_i_formula(config, package_name.clone(), root_formula)
             }
-            let root_formula = resolve_i_root_formula(&package_name)?;
-            run_i_formula(config, package_name, root_formula)
         }
         RequestedPackage::HomebrewFormula(formula) => {
             run_i_formula(config, formula.clone(), formula)
         }
-        RequestedPackage::NpmPackage(npm_package) => run_i_npm(config, package_name, npm_package),
-        RequestedPackage::PipPackage(pip_package) => run_i_pip(config, package_name, pip_package),
+        RequestedPackage::NpmPackage(npm_package) => {
+            run_i_npm(config, package_name.clone(), npm_package)
+        }
+        RequestedPackage::PipPackage(pip_package) => {
+            run_i_pip(config, package_name.clone(), pip_package)
+        }
+    };
+    if let Err(err) = result {
+        rollback_failed_install(
+            Path::new(OPT_PKG_ROOT),
+            &package_name,
+            Path::new(USR_LOCAL_BIN),
+        )
+        .map_err(|cleanup_err| format!("{err}\ncleanup failed: {cleanup_err}"))?;
+        return Err(err);
     }
+    Ok(())
 }
 
 fn run_i_formula(
@@ -3393,21 +3406,40 @@ fn ensure_package_installed(opt_root: &Path, package_name: &str) -> Result<(), S
     }
 }
 
-fn ensure_installable_package(package_name: &str, force: bool) -> Result<(), String> {
-    ensure_installable_package_at(Path::new(OPT_PKG_ROOT), package_name, force)
-}
-
-fn ensure_installable_package_at(
+fn prepare_install_target(
     opt_root: &Path,
     package_name: &str,
     force: bool,
+    bin_dir: &Path,
 ) -> Result<(), String> {
     let install_root = package_install_root(opt_root, package_name)?;
     match fs::symlink_metadata(&install_root) {
-        Ok(_) if force => Ok(()),
+        Ok(_) if force || !install_root_has_valid_receipt(package_name, &install_root)? => {
+            remove_existing_package_install(opt_root, package_name, bin_dir)
+        }
         Ok(_) => Err(format!(
             "package {package_name} is already installed; use --force/-f to reinstall"
         )),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
+    }
+}
+
+fn install_root_has_valid_receipt(package_name: &str, install_root: &Path) -> Result<bool, String> {
+    let Some(receipt) = load_package_receipt(&install_root.join(ROOT_RECEIPT))? else {
+        return Ok(false);
+    };
+    Ok(receipt.package_name == package_name)
+}
+
+fn rollback_failed_install(
+    opt_root: &Path,
+    package_name: &str,
+    bin_dir: &Path,
+) -> Result<(), String> {
+    let install_root = package_install_root(opt_root, package_name)?;
+    match fs::symlink_metadata(&install_root) {
+        Ok(_) => remove_existing_package_install(opt_root, package_name, bin_dir),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
     }
@@ -8186,19 +8218,78 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
-    fn ensure_installable_package_requires_force_for_existing_install() {
+    fn prepare_install_target_requires_force_for_existing_install() {
         let temp = TempDir::new().unwrap();
-        fs::create_dir_all(temp.path().join("already-installed")).unwrap();
+        let install_root = temp.path().join("already-installed");
+        fs::create_dir_all(&install_root).unwrap();
+        write_package_receipt(
+            &install_root.join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "already-installed".to_string(),
+                version: "1.0.0".to_string(),
+                source: PackageReceiptSource::Formula {
+                    root_formula: "already-installed".to_string(),
+                },
+            },
+        )
+        .unwrap();
 
-        let err =
-            ensure_installable_package_at(temp.path(), "already-installed", false).unwrap_err();
+        let err = prepare_install_target(temp.path(), "already-installed", false, temp.path())
+            .unwrap_err();
 
         assert_eq!(
             err,
             "package already-installed is already installed; use --force/-f to reinstall"
         );
-        ensure_installable_package_at(temp.path(), "already-installed", true).unwrap();
-        ensure_installable_package_at(temp.path(), "not-installed", false).unwrap();
+        prepare_install_target(temp.path(), "already-installed", true, temp.path()).unwrap();
+        assert!(!install_root.exists());
+        prepare_install_target(temp.path(), "not-installed", false, temp.path()).unwrap();
+    }
+
+    #[test]
+    fn prepare_install_target_removes_incomplete_install() {
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        let install_root = package_install_root(temp.path(), "npm:openclaw").unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("stale"), b"old").unwrap();
+        write_stub_manifest(
+            &install_root.join(STUB_MANIFEST),
+            &StubManifest {
+                stubs: vec!["openclaw".to_string()],
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("openclaw"), b"#!/bin/sh\n").unwrap();
+
+        prepare_install_target(temp.path(), "npm:openclaw", false, &bin_dir).unwrap();
+
+        assert!(!install_root.exists());
+        assert!(!bin_dir.join("openclaw").exists());
+    }
+
+    #[test]
+    fn rollback_failed_install_removes_partial_root_and_stubs() {
+        let temp = TempDir::new().unwrap();
+        let bin_dir = temp.path().join("bin");
+        let install_root = package_install_root(temp.path(), "npm:openclaw").unwrap();
+        fs::create_dir_all(&install_root).unwrap();
+        fs::write(install_root.join("stale"), b"old").unwrap();
+        write_stub_manifest(
+            &install_root.join(STUB_MANIFEST),
+            &StubManifest {
+                stubs: vec!["openclaw".to_string()],
+            },
+        )
+        .unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        fs::write(bin_dir.join("openclaw"), b"#!/bin/sh\n").unwrap();
+
+        rollback_failed_install(temp.path(), "npm:openclaw", &bin_dir).unwrap();
+
+        assert!(!install_root.exists());
+        assert!(!bin_dir.join("openclaw").exists());
     }
 
     #[test]
