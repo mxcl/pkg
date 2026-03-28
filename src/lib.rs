@@ -98,6 +98,7 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
 const TMP_X_ROOT: &str = "/tmp/x";
 const TMP_TOOL_ROOT: &str = "/tmp/pkgtool";
 const OPT_PKG_ROOT: &str = "/opt";
+const OPT_NPM_ROOT: &str = "/opt/npm";
 const PKG_STATE_LOCK: &str = ".pkg.lock";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
 #[cfg(feature = "gold-release")]
@@ -334,6 +335,12 @@ struct PackageStatus {
     latest_version: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InstalledPackageRef {
+    package_name: String,
+    install_root: PathBuf,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct StubManifest {
     stubs: Vec<String>,
@@ -467,6 +474,24 @@ impl InstallPlan {
             install_root,
             tmp_root: temp_root_for_target_root(
                 Path::new(OPT_PKG_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            ),
+        }
+    }
+
+    fn for_i_npm(package_name: String, root_formula: String, npm_package: &str) -> Self {
+        let npm_root = PathBuf::from(OPT_NPM_ROOT);
+        let stable_root = npm_root.join(npm_package_install_leaf_name(npm_package));
+        let install_root = stable_root.clone();
+        Self {
+            mode: Mode::I,
+            package_name,
+            root_formula,
+            stable_root,
+            install_root,
+            tmp_root: temp_root_for_target_root(
+                &npm_root,
                 Path::new(SYSTEM_TMP_ROOT),
                 Path::new(TMP_TOOL_ROOT),
             ),
@@ -1243,7 +1268,7 @@ fn run_i_vendor(
 fn run_i_npm(config: &Config, package_name: String, npm_package: String) -> Result<(), String> {
     let progress = InstallProgress::new(&package_name);
     let result = (|| {
-        let plan = InstallPlan::for_i(package_name.clone(), package_name.clone());
+        let plan = InstallPlan::for_i_npm(package_name.clone(), package_name.clone(), &npm_package);
         let previous_stubs = load_stub_manifest(&plan.package_manifest_path())?.stubs;
         let (staged_plan, _staging_workspace) = prepare_i_install_plan(&plan)?;
         let version = resolve_npm_package_version(&npm_package)?;
@@ -1644,7 +1669,7 @@ fn parse_uninstall_package_name(value: &OsString) -> Result<String, String> {
     }
     if let Some(npm_package) = package.strip_prefix("npm:") {
         validate_npm_package_name(npm_package)?;
-        return Ok(npm_package_install_name(npm_package));
+        return Ok(npm_package_display_name(npm_package));
     }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
@@ -1671,12 +1696,26 @@ fn validate_npm_package_name(package: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn npm_package_install_name(package: &str) -> String {
+fn npm_package_display_name(package: &str) -> String {
+    format!("npm:{package}")
+}
+
+fn npm_package_install_leaf_name(package: &str) -> String {
     package.rsplit('/').next().unwrap_or(package).to_string()
 }
 
 fn npm_package_executable_name(package: &str) -> String {
-    npm_package_install_name(package)
+    npm_package_install_leaf_name(package)
+}
+
+fn package_install_root(opt_root: &Path, package_name: &str) -> Result<PathBuf, String> {
+    if let Some(npm_package) = package_name.strip_prefix("npm:") {
+        validate_npm_package_name(npm_package)?;
+        return Ok(opt_root
+            .join("npm")
+            .join(npm_package_install_leaf_name(npm_package)));
+    }
+    Ok(opt_root.join(package_name))
 }
 
 fn resolve_i_root_formula(package: &str) -> Result<String, String> {
@@ -1780,8 +1819,10 @@ fn resolve_package_statuses(
 ) -> Result<Vec<PackageStatus>, String> {
     match selection {
         PackageSelection::AllInstalled => resolve_scanned_package_statuses(
-            installed_package_names(Path::new(OPT_PKG_ROOT))?,
-            |package_name| resolve_package_status(config, package_name),
+            installed_package_refs(Path::new(OPT_PKG_ROOT))?,
+            |package| {
+                resolve_package_status_at(config, &package.package_name, &package.install_root)
+            },
             |message| eprintln!("{message}"),
         ),
         PackageSelection::Requested(packages) => {
@@ -1818,38 +1859,40 @@ fn filter_outdated_package_statuses(statuses: Vec<PackageStatus>) -> Vec<Package
 }
 
 fn resolve_scanned_package_statuses<Resolve, Warn>(
-    mut package_names: Vec<String>,
+    mut packages: Vec<InstalledPackageRef>,
     mut resolve: Resolve,
     mut warn: Warn,
 ) -> Result<Vec<PackageStatus>, String>
 where
-    Resolve: FnMut(&str) -> Result<PackageStatus, String>,
+    Resolve: FnMut(&InstalledPackageRef) -> Result<PackageStatus, String>,
     Warn: FnMut(String),
 {
-    package_names.sort();
-    package_names.dedup();
+    packages.sort_by(|left, right| left.package_name.cmp(&right.package_name));
+    packages.dedup_by(|left, right| left.package_name == right.package_name);
 
-    let mut statuses = Vec::with_capacity(package_names.len());
-    for package_name in package_names {
-        if ignored_opt_directory(&package_name) {
-            continue;
-        }
-        match resolve(&package_name) {
+    let mut statuses = Vec::with_capacity(packages.len());
+    for package in packages {
+        match resolve(&package) {
             Ok(status) => statuses.push(status),
             Err(err) => warn(format!(
-                "warning: skipping {OPT_PKG_ROOT}/{package_name}: {err}"
+                "warning: skipping {}: {err}",
+                package.install_root.display()
             )),
         }
     }
     Ok(statuses)
 }
 
-fn ignored_opt_directory(package_name: &str) -> bool {
-    package_name == "homebrew"
+fn resolve_package_status(config: &Config, package_name: &str) -> Result<PackageStatus, String> {
+    let install_root = package_install_root(Path::new(OPT_PKG_ROOT), package_name)?;
+    resolve_package_status_at(config, package_name, &install_root)
 }
 
-fn resolve_package_status(config: &Config, package_name: &str) -> Result<PackageStatus, String> {
-    let install_root = PathBuf::from(OPT_PKG_ROOT).join(package_name);
+fn resolve_package_status_at(
+    config: &Config,
+    package_name: &str,
+    install_root: &Path,
+) -> Result<PackageStatus, String> {
     let metadata = fs::symlink_metadata(&install_root).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => format!("package {package_name} is not installed"),
         _ => format!("failed to stat {}: {err}", install_root.display()),
@@ -1883,7 +1926,7 @@ fn requested_package_name(package: &RequestedPackage) -> String {
         RequestedPackage::Auto(package_name) | RequestedPackage::HomebrewFormula(package_name) => {
             package_name.clone()
         }
-        RequestedPackage::NpmPackage(package_name) => npm_package_install_name(package_name),
+        RequestedPackage::NpmPackage(package_name) => npm_package_display_name(package_name),
     }
 }
 
@@ -2035,7 +2078,15 @@ fn exec_self_update_restart() -> Result<(), String> {
     Err(format!("failed to exec {}: {err}", SELF_UPDATE_TARGET))
 }
 
+#[cfg(test)]
 fn installed_package_names(opt_root: &Path) -> Result<Vec<String>, String> {
+    Ok(installed_package_refs(opt_root)?
+        .into_iter()
+        .map(|package| package.package_name)
+        .collect())
+}
+
+fn installed_package_refs(opt_root: &Path) -> Result<Vec<InstalledPackageRef>, String> {
     let entries = match fs::read_dir(opt_root) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -2053,9 +2104,47 @@ fn installed_package_names(opt_root: &Path) -> Result<Vec<String>, String> {
         if name.starts_with('.') || !path.is_dir() {
             continue;
         }
-        packages.push(name);
+        if name == "homebrew" {
+            continue;
+        }
+        if name == "npm" {
+            packages.extend(installed_npm_package_refs(&path)?);
+            continue;
+        }
+        packages.push(InstalledPackageRef {
+            package_name: name,
+            install_root: path,
+        });
     }
-    packages.sort();
+    Ok(packages)
+}
+
+fn installed_npm_package_refs(npm_root: &Path) -> Result<Vec<InstalledPackageRef>, String> {
+    let entries = match fs::read_dir(npm_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("failed to read {}: {err}", npm_root.display())),
+    };
+
+    let mut packages = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read {}: {err}", npm_root.display()))?;
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("non-utf8 directory name under {}", npm_root.display()))?;
+        if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        packages.push(InstalledPackageRef {
+            package_name: match load_package_receipt(&path.join(ROOT_RECEIPT)) {
+                Ok(Some(receipt)) => receipt.package_name,
+                Ok(None) | Err(_) => npm_package_display_name(&name),
+            },
+            install_root: path,
+        });
+    }
     Ok(packages)
 }
 
@@ -2726,7 +2815,7 @@ fn uninstall_package(package_name: &str) -> Result<(), String> {
 }
 
 fn ensure_package_installed(opt_root: &Path, package_name: &str) -> Result<(), String> {
-    let install_root = opt_root.join(package_name);
+    let install_root = package_install_root(opt_root, package_name)?;
     match fs::symlink_metadata(&install_root) {
         Ok(_) => Ok(()),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
@@ -2745,7 +2834,7 @@ fn ensure_installable_package_at(
     package_name: &str,
     force: bool,
 ) -> Result<(), String> {
-    let install_root = opt_root.join(package_name);
+    let install_root = package_install_root(opt_root, package_name)?;
     match fs::symlink_metadata(&install_root) {
         Ok(_) if force => Ok(()),
         Ok(_) => Err(format!(
@@ -2772,7 +2861,7 @@ fn remove_package_stubs_from_bin(
     package_name: &str,
     bin_dir: &Path,
 ) -> Result<(), String> {
-    let install_root = opt_root.join(package_name);
+    let install_root = package_install_root(opt_root, package_name)?;
     let manifest = load_stub_manifest(&install_root.join(STUB_MANIFEST))?;
     let shared_stubs = collect_shared_stubs(opt_root, package_name)?;
 
@@ -2794,7 +2883,7 @@ fn remove_existing_package_install(
     package_name: &str,
     bin_dir: &Path,
 ) -> Result<(), String> {
-    let install_root = opt_root.join(package_name);
+    let install_root = package_install_root(opt_root, package_name)?;
     match fs::symlink_metadata(&install_root) {
         Ok(_) => {
             remove_package_stubs_from_bin(opt_root, package_name, bin_dir)?;
@@ -2811,23 +2900,11 @@ fn collect_shared_stubs(
     excluded_package: &str,
 ) -> Result<HashSet<String>, String> {
     let mut stubs = HashSet::new();
-    let entries = match fs::read_dir(opt_root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(stubs),
-        Err(err) => return Err(format!("failed to read {}: {err}", opt_root.display())),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("failed to read {}: {err}", opt_root.display()))?;
-        let name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| format!("non-utf8 directory name under {}", opt_root.display()))?;
-        if name == excluded_package || name.starts_with('.') {
+    for package in installed_package_refs(opt_root)? {
+        if package.package_name == excluded_package {
             continue;
         }
-
-        for stub in load_stub_manifest(&entry.path().join(STUB_MANIFEST))?.stubs {
+        for stub in load_stub_manifest(&package.install_root.join(STUB_MANIFEST))?.stubs {
             stubs.insert(stub);
         }
     }
@@ -2851,38 +2928,16 @@ fn refresh_post_uninstall_stubs(opt_root: &Path, bin_dir: &Path) -> Result<(), S
 
 fn find_supported_post_install_prefixes(opt_root: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     let mut prefixes = Vec::new();
-    let entries = match fs::read_dir(opt_root) {
-        Ok(entries) => entries,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(prefixes),
-        Err(err) => return Err(format!("failed to read {}: {err}", opt_root.display())),
-    };
-
-    for entry in entries {
-        let entry = entry.map_err(|err| format!("failed to read {}: {err}", opt_root.display()))?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let package_name = entry
-            .file_name()
-            .into_string()
-            .map_err(|_| format!("non-utf8 directory name under {}", opt_root.display()))?;
-        if package_name.starts_with('.') {
-            continue;
-        }
-
-        if let Some(formula) = installed_post_install_formula(&path, &package_name)? {
-            prefixes.push((formula, path.clone()));
+    for package in installed_package_refs(opt_root)? {
+        if let Some(formula) = installed_post_install_formula(&package.install_root)? {
+            prefixes.push((formula, package.install_root.clone()));
         }
     }
 
     Ok(prefixes)
 }
 
-fn installed_post_install_formula(
-    install_root: &Path,
-    _package_name: &str,
-) -> Result<Option<String>, String> {
+fn installed_post_install_formula(install_root: &Path) -> Result<Option<String>, String> {
     if let Some(receipt) = load_package_receipt(&install_root.join(ROOT_RECEIPT))? {
         let PackageReceiptSource::Formula { root_formula } = receipt.source else {
             return Ok(None);
@@ -5516,7 +5571,7 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             request,
             Some(UninstallRequest {
-                packages: vec!["qmd".to_string()],
+                packages: vec!["npm:@tobilu/qmd".to_string()],
             })
         );
     }
@@ -5651,6 +5706,7 @@ package or `bar` for the package that provides the `foo` executable"
             vec![
                 OsString::from("ffmpeg"),
                 OsString::from("brew.sh/python@3.12"),
+                OsString::from("npm:openclaw"),
             ]
             .into_iter(),
             print_outdated_usage,
@@ -5663,6 +5719,7 @@ package or `bar` for the package that provides the `foo` executable"
                 selection: PackageSelection::Requested(vec![
                     RequestedPackage::Auto("ffmpeg".to_string()),
                     RequestedPackage::HomebrewFormula("python@3.12".to_string()),
+                    RequestedPackage::NpmPackage("openclaw".to_string()),
                 ]),
             })
         );
@@ -5686,25 +5743,44 @@ package or `bar` for the package that provides the `foo` executable"
     fn installed_package_names_skip_hidden_entries_and_files() {
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join("deno")).unwrap();
+        fs::create_dir_all(temp.path().join("npm/openclaw")).unwrap();
         fs::create_dir_all(temp.path().join(".tmp")).unwrap();
         fs::write(temp.path().join("README"), b"not a package").unwrap();
+        write_package_receipt(
+            &temp.path().join("npm/openclaw").join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "npm:openclaw".to_string(),
+                version: "1.2.3".to_string(),
+                source: PackageReceiptSource::Npm {
+                    package_name: "openclaw".to_string(),
+                },
+            },
+        )
+        .unwrap();
 
+        let mut installed = installed_package_names(temp.path()).unwrap();
+        installed.sort();
         assert_eq!(
-            installed_package_names(temp.path()).unwrap(),
-            vec!["deno".to_string()]
+            installed,
+            vec!["deno".to_string(), "npm:openclaw".to_string()]
         );
     }
 
     #[test]
-    fn resolve_scanned_package_statuses_skips_homebrew_and_warns_for_other_dirs() {
+    fn resolve_scanned_package_statuses_warns_for_other_dirs() {
         let mut warnings = Vec::new();
         let statuses = resolve_scanned_package_statuses(
             vec![
-                "homebrew".to_string(),
-                "deno".to_string(),
-                "scratch".to_string(),
+                InstalledPackageRef {
+                    package_name: "deno".to_string(),
+                    install_root: PathBuf::from("/opt/deno"),
+                },
+                InstalledPackageRef {
+                    package_name: "scratch".to_string(),
+                    install_root: PathBuf::from("/opt/scratch"),
+                },
             ],
-            |package_name| match package_name {
+            |package| match package.package_name.as_str() {
                 "deno" => Ok(PackageStatus {
                     package_name: "deno".to_string(),
                     source: PackageReceiptSource::Vendor {
@@ -5713,8 +5789,9 @@ package or `bar` for the package that provides the `foo` executable"
                     installed_version: "2.7.7".to_string(),
                     latest_version: "2.7.8".to_string(),
                 }),
-                other => Err(format!(
-                    "package {other} is installed but missing package metadata"
+                _ => Err(format!(
+                    "package {} is installed but missing package metadata",
+                    package.package_name
                 )),
             },
             |warning| warnings.push(warning),
@@ -7396,6 +7473,26 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
     }
 
     #[test]
+    fn install_plan_for_i_npm_uses_dedicated_opt_root() {
+        let plan = InstallPlan::for_i_npm(
+            "npm:openclaw".to_string(),
+            "npm:openclaw".to_string(),
+            "openclaw",
+        );
+
+        assert_eq!(plan.stable_root, PathBuf::from("/opt/npm/openclaw"));
+        assert_eq!(plan.install_root, PathBuf::from("/opt/npm/openclaw"));
+        assert_eq!(
+            plan.tmp_root,
+            temp_root_for_target_root(
+                Path::new(OPT_NPM_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            )
+        );
+    }
+
+    #[test]
     fn install_plan_for_x_uses_detected_tmp_root() {
         let plan = InstallPlan::for_x("caddy".to_string());
 
@@ -7833,7 +7930,7 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
                 ("python@3.12".to_string(), python),
             ]
         );
-        assert_eq!(installed_post_install_formula(&deno, "deno").unwrap(), None);
+        assert_eq!(installed_post_install_formula(&deno).unwrap(), None);
     }
 
     #[test]
