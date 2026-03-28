@@ -12,8 +12,7 @@ pub static ENTRY: VendorEntry = VendorEntry {
 };
 
 pub fn dependencies() -> &'static [&'static str] {
-    // qmd needs brew’s sqlite: indeed. macOS sqlite has no extension support.
-    &["node", "sqlite"]
+    &["node"]
 }
 
 pub fn executables() -> &'static [&'static str] {

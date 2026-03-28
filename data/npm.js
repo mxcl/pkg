@@ -1,0 +1,5 @@
+{
+  qmd: {
+    homebrewDeps: ["sqlite"],
+  },
+}

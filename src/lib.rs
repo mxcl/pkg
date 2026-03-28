@@ -69,6 +69,7 @@ mod post_install_hooks {
 
 const DB_SCHEMA_VERSION: u32 = 2;
 const EMBEDDED_DB: &[u8] = include_bytes!("../data/db.json");
+const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.js");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
     include_str!("../data/post_install_check_skip.jsonc");
 const BREW_PACKAGE_PREFIX: &str = "brew:";
@@ -119,6 +120,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const SAFE_BINARY_PATH_BYTES: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-/@";
 static POST_INSTALL_CHECK_SKIP: OnceLock<HashSet<String>> = OnceLock::new();
+static NPM_PACKAGE_DATA: OnceLock<HashMap<String, NpmPackageData>> = OnceLock::new();
 static FORMULA_ALIAS_INDEX: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
 
 fn formula_api_root() -> String {
@@ -135,6 +137,12 @@ struct Db {
     #[allow(dead_code)]
     generated_at: String,
     entries: HashMap<String, String>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct NpmPackageData {
+    #[serde(default, rename = "homebrewDeps")]
+    homebrew_dependencies: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1274,7 +1282,13 @@ fn run_i_npm(config: &Config, package_name: String, npm_package: String) -> Resu
         let (staged_plan, _staging_workspace) = prepare_i_install_plan(&plan)?;
         let version = resolve_npm_package_version(&npm_package)?;
         let executable = npm_package_executable_name(&npm_package);
-        let dependencies = resolve_vendor_dependency_specs(&["node"], config, false)?;
+        let mut dependency_names = vec!["node".to_string()];
+        append_npm_package_homebrew_dependencies(&mut dependency_names, &npm_package);
+        let dependency_names = dependency_names
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        let dependencies = resolve_vendor_dependency_specs(&dependency_names, config, false)?;
         let dependency_state = resolve_dependency_install_state(
             &dependencies.formula_graph,
             &staged_plan.tmp_root,
@@ -1812,6 +1826,45 @@ fn embedded_post_install_check_skip() -> &'static HashSet<String> {
             .into_iter()
             .collect()
     })
+}
+
+fn embedded_npm_package_data() -> &'static HashMap<String, NpmPackageData> {
+    NPM_PACKAGE_DATA.get_or_init(|| {
+        json5::from_str(EMBEDDED_NPM_DATA).expect("failed to parse embedded npm package data")
+    })
+}
+
+fn npm_package_homebrew_dependencies(package: &str) -> Vec<String> {
+    let data = embedded_npm_package_data();
+    if let Some(entry) = data.get(package) {
+        return entry.homebrew_dependencies.clone();
+    }
+    if let Some((_, leaf_name)) = package.rsplit_once('/') {
+        if let Some(entry) = data.get(leaf_name) {
+            return entry.homebrew_dependencies.clone();
+        }
+    }
+    Vec::new()
+}
+
+fn append_npm_package_homebrew_dependencies(formula_names: &mut Vec<String>, package: &str) {
+    for dependency in npm_package_homebrew_dependencies(package) {
+        push_unique_string(formula_names, dependency);
+    }
+}
+
+fn append_vendor_npm_homebrew_dependencies(
+    formula_names: &mut Vec<String>,
+    vendor_installs: &[VendorInstall],
+) {
+    for install in vendor_installs {
+        if let vendor::InstallStrategy::NpmGlobal {
+            package: npm_package,
+        } = (install.package.install)(&install.version)
+        {
+            append_npm_package_homebrew_dependencies(formula_names, &npm_package);
+        }
+    }
 }
 
 fn ensure_db_schema(db: &Db) -> Result<(), String> {
@@ -3432,9 +3485,7 @@ fn resolve_vendor_dependency_specs(
     config: &Config,
     allow_supported_post_install: bool,
 ) -> Result<ResolvedVendorDependencies, String> {
-    let (formula_names, vendor_names) = partition_dependency_names(dependencies)?;
-    let formula_graph =
-        resolve_formula_specs(&formula_names, config, allow_supported_post_install)?;
+    let (mut formula_names, vendor_names) = partition_dependency_names(dependencies)?;
     let mut vendor_installs = Vec::with_capacity(vendor_names.len());
     for name in vendor_names {
         let package =
@@ -3442,6 +3493,9 @@ fn resolve_vendor_dependency_specs(
         let version = (package.version)()?;
         vendor_installs.push(VendorInstall { package, version });
     }
+    append_vendor_npm_homebrew_dependencies(&mut formula_names, &vendor_installs);
+    let formula_graph =
+        resolve_formula_specs(&formula_names, config, allow_supported_post_install)?;
 
     Ok(ResolvedVendorDependencies {
         formula_graph,
@@ -6554,8 +6608,34 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     fn partition_dependency_names_recurses_through_vendor_dependencies() {
         let (formulas, vendors) = partition_dependency_names(&["qmd"]).unwrap();
 
-        assert_eq!(formulas, vec!["sqlite".to_string()]);
+        assert!(formulas.is_empty());
         assert_eq!(vendors, vec!["node".to_string(), "qmd".to_string()]);
+    }
+
+    #[test]
+    fn npm_package_homebrew_dependencies_support_exact_and_leaf_matches() {
+        assert_eq!(
+            npm_package_homebrew_dependencies("qmd"),
+            vec!["sqlite".to_string()]
+        );
+        assert_eq!(
+            npm_package_homebrew_dependencies("@tobilu/qmd"),
+            vec!["sqlite".to_string()]
+        );
+        assert!(npm_package_homebrew_dependencies("openclaw").is_empty());
+    }
+
+    #[test]
+    fn append_vendor_npm_homebrew_dependencies_uses_vendor_install_strategy() {
+        let qmd = VendorInstall {
+            package: vendor::get("qmd").unwrap(),
+            version: Version::parse("1.2.3").unwrap(),
+        };
+        let mut formulas = Vec::new();
+
+        append_vendor_npm_homebrew_dependencies(&mut formulas, &[qmd]);
+
+        assert_eq!(formulas, vec!["sqlite".to_string()]);
     }
 
     #[test]
