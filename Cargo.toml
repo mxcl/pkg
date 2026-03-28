@@ -1,5 +1,5 @@
 [package]
-name = "pkg"
+name = "p0r"
 version = "0.3.0"
 edition = "2024"
 autobins = false
@@ -8,8 +8,8 @@ autobins = false
 gold-release = []
 
 [[bin]]
-name = "pkg"
-path = "src/bin/pkg.rs"
+name = "p0r"
+path = "src/bin/p0r.rs"
 
 [dependencies]
 flate2 = "1"

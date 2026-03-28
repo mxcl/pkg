@@ -1,7 +1,7 @@
 use std::process::{Command, Output};
 
-fn run_pkg(args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_pkg"))
+fn run_p0r(args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_p0r"))
         .args(args)
         .output()
         .unwrap()
@@ -16,54 +16,54 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn pkg_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
-    let output = run_pkg(&[]);
+fn p0r_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
+    let output = run_p0r(&[]);
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg <subcommand> [args...]"));
-    assert!(stderr(&output).contains("pkg: missing subcommand"));
+    assert!(stdout(&output).contains("Usage: p0r <subcommand> [args...]"));
+    assert!(stderr(&output).contains("p0r: missing subcommand"));
 
-    let output = run_pkg(&["--help"]);
+    let output = run_p0r(&["--help"]);
     assert!(output.status.success());
     assert!(stdout(&output).contains("Subcommands:"));
 
-    let output = run_pkg(&["--version"]);
+    let output = run_p0r(&["--version"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains("pkg 0.3.0"));
+    assert!(stdout(&output).contains("p0r 0.3.0"));
 
-    let output = run_pkg(&["help", "x"]);
+    let output = run_p0r(&["help", "x"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg run"));
+    assert!(stdout(&output).contains("Usage: p0r run"));
 
-    let output = run_pkg(&["help", "update"]);
+    let output = run_p0r(&["help", "update"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg update"));
+    assert!(stdout(&output).contains("Usage: p0r update"));
 
-    let output = run_pkg(&["wat"]);
+    let output = run_p0r(&["wat"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("pkg: unknown subcommand 'wat'"));
+    assert!(stderr(&output).contains("p0r: unknown subcommand 'wat'"));
 }
 
 #[test]
-fn pkg_subcommand_parsing_covers_help_version_and_non_root_failures() {
+fn p0r_subcommand_parsing_covers_help_version_and_non_root_failures() {
     let cases = [
-        (vec!["run", "--help"], true, "Usage: pkg run"),
-        (vec!["run", "--version"], true, "pkg run 0.3.0"),
-        (vec!["x", "--help"], true, "Usage: pkg x"),
-        (vec!["x", "--version"], true, "pkg x 0.3.0"),
-        (vec!["i", "--help"], true, "Usage: pkg i"),
-        (vec!["i", "--version"], true, "pkg i 0.3.0"),
-        (vec!["update", "--help"], true, "Usage: pkg update"),
-        (vec!["update", "--version"], true, "pkg update 0.3.0"),
-        (vec!["list", "--help"], true, "Usage: pkg list"),
-        (vec!["list", "--version"], true, "pkg list 0.3.0"),
-        (vec!["outdated", "--help"], true, "Usage: pkg outdated"),
-        (vec!["outdated", "--version"], true, "pkg outdated 0.3.0"),
-        (vec!["uninstall", "--help"], true, "Usage: pkg uninstall"),
-        (vec!["uninstall", "--version"], true, "pkg uninstall 0.3.0"),
+        (vec!["run", "--help"], true, "Usage: p0r run"),
+        (vec!["run", "--version"], true, "p0r run 0.3.0"),
+        (vec!["x", "--help"], true, "Usage: p0r x"),
+        (vec!["x", "--version"], true, "p0r x 0.3.0"),
+        (vec!["i", "--help"], true, "Usage: p0r i"),
+        (vec!["i", "--version"], true, "p0r i 0.3.0"),
+        (vec!["update", "--help"], true, "Usage: p0r update"),
+        (vec!["update", "--version"], true, "p0r update 0.3.0"),
+        (vec!["list", "--help"], true, "Usage: p0r list"),
+        (vec!["list", "--version"], true, "p0r list 0.3.0"),
+        (vec!["outdated", "--help"], true, "Usage: p0r outdated"),
+        (vec!["outdated", "--version"], true, "p0r outdated 0.3.0"),
+        (vec!["uninstall", "--help"], true, "Usage: p0r uninstall"),
+        (vec!["uninstall", "--version"], true, "p0r uninstall 0.3.0"),
     ];
 
     for (args, success, needle) in cases {
-        let output = run_pkg(&args);
+        let output = run_p0r(&args);
         assert_eq!(output.status.success(), success, "{args:?}");
         assert!(
             stdout(&output).contains(needle),
@@ -72,37 +72,37 @@ fn pkg_subcommand_parsing_covers_help_version_and_non_root_failures() {
         );
     }
 
-    let output = run_pkg(&["x"]);
+    let output = run_p0r(&["x"]);
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg x"));
-    assert!(stderr(&output).contains("pkg: missing executable name"));
+    assert!(stdout(&output).contains("Usage: p0r x"));
+    assert!(stderr(&output).contains("p0r: missing executable name"));
 
-    let output = run_pkg(&["run"]);
+    let output = run_p0r(&["run"]);
     assert!(!output.status.success());
-    assert!(stdout(&output).contains("Usage: pkg run"));
-    assert!(stderr(&output).contains("pkg: missing executable name"));
+    assert!(stdout(&output).contains("Usage: p0r run"));
+    assert!(stderr(&output).contains("p0r: missing executable name"));
 
-    let output = run_pkg(&["x", "+ripgrep", "+pcre2", "rg"]);
+    let output = run_p0r(&["x", "+ripgrep", "+pcre2", "rg"]);
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("pkg: supports a single root package"));
+    assert!(stderr(&output).contains("p0r: supports a single root package"));
 
     if unsafe { libc::geteuid() } != 0 {
-        let output = run_pkg(&["i", "deno"]);
+        let output = run_p0r(&["i", "deno"]);
         assert!(!output.status.success());
-        assert!(stderr(&output).contains("pkg: must be run as root"));
+        assert!(stderr(&output).contains("p0r: must be run as root"));
 
-        let output = run_pkg(&["update"]);
+        let output = run_p0r(&["update"]);
         assert!(!output.status.success());
-        assert!(stderr(&output).contains("pkg: must be run as root"));
+        assert!(stderr(&output).contains("p0r: must be run as root"));
     }
 }
 
 #[test]
-fn pkg_x_can_install_and_run_ripgrep() {
+fn p0r_x_can_install_and_run_ripgrep() {
     let _ = std::fs::remove_dir_all("/tmp/x/ripgrep");
     let _ = std::fs::remove_dir_all("/tmp/x/.tmp");
 
-    let output = run_pkg(&["x", "+ripgrep", "rg", "--version"]);
+    let output = run_p0r(&["x", "+ripgrep", "rg", "--version"]);
     assert!(output.status.success(), "stderr: {}", stderr(&output));
     assert!(stdout(&output).contains("ripgrep "));
 }
