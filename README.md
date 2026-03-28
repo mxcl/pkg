@@ -1,5 +1,7 @@
 # `pkg`
 
+[![Coverage Status](https://coveralls.io/repos/github/mxcl/pkg/badge.svg?branch=main)](https://coveralls.io/github/mxcl/pkg?branch=main)
+
 Execution, performance and security focused package manager for macOS.
 
 ## Install
