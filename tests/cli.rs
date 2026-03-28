@@ -1,5 +1,9 @@
 use std::process::{Command, Output};
 
+fn pkg_version() -> &'static str {
+    env!("CARGO_PKG_VERSION")
+}
+
 fn run_ss(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_ss"))
         .args(args)
@@ -28,7 +32,7 @@ fn ss_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
 
     let output = run_ss(&["--version"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains("ss 0.3.0"));
+    assert!(stdout(&output).contains(&format!("ss {}", pkg_version())));
 
     let output = run_ss(&["help", "x"]);
     assert!(output.status.success());
@@ -45,31 +49,57 @@ fn ss_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
 
 #[test]
 fn ss_subcommand_parsing_covers_help_version_and_non_root_failures() {
+    let version = pkg_version();
     let cases = [
-        (vec!["run", "--help"], true, "Usage: ss run"),
-        (vec!["run", "--version"], true, "ss run 0.3.0"),
-        (vec!["x", "--help"], true, "Usage: ss x"),
-        (vec!["x", "--version"], true, "ss x 0.3.0"),
-        (vec!["i", "--help"], true, "Usage: ss i"),
-        (vec!["i", "--version"], true, "ss i 0.3.0"),
-        (vec!["update", "--help"], true, "Usage: ss update"),
-        (vec!["update", "--version"], true, "ss update 0.3.0"),
-        (vec!["list", "--help"], true, "Usage: ss list"),
-        (vec!["list", "--version"], true, "ss list 0.3.0"),
-        (vec!["outdated", "--help"], true, "Usage: ss outdated"),
-        (vec!["outdated", "--version"], true, "ss outdated 0.3.0"),
-        (vec!["uninstall", "--help"], true, "Usage: ss uninstall"),
-        (vec!["uninstall", "--version"], true, "ss uninstall 0.3.0"),
+        (vec!["run", "--help"], true, "Usage: ss run".to_string()),
+        (vec!["run", "--version"], true, format!("ss run {version}")),
+        (vec!["x", "--help"], true, "Usage: ss x".to_string()),
+        (vec!["x", "--version"], true, format!("ss x {version}")),
+        (vec!["i", "--help"], true, "Usage: ss i".to_string()),
+        (vec!["i", "--version"], true, format!("ss i {version}")),
+        (
+            vec!["update", "--help"],
+            true,
+            "Usage: ss update".to_string(),
+        ),
+        (
+            vec!["update", "--version"],
+            true,
+            format!("ss update {version}"),
+        ),
+        (vec!["list", "--help"], true, "Usage: ss list".to_string()),
+        (
+            vec!["list", "--version"],
+            true,
+            format!("ss list {version}"),
+        ),
+        (
+            vec!["outdated", "--help"],
+            true,
+            "Usage: ss outdated".to_string(),
+        ),
+        (
+            vec!["outdated", "--version"],
+            true,
+            format!("ss outdated {version}"),
+        ),
+        (
+            vec!["uninstall", "--help"],
+            true,
+            "Usage: ss uninstall".to_string(),
+        ),
+        (
+            vec!["uninstall", "--version"],
+            true,
+            format!("ss uninstall {version}"),
+        ),
     ];
 
     for (args, success, needle) in cases {
         let output = run_ss(&args);
+        let stdout = stdout(&output);
         assert_eq!(output.status.success(), success, "{args:?}");
-        assert!(
-            stdout(&output).contains(needle),
-            "{args:?}: {}",
-            stdout(&output)
-        );
+        assert!(stdout.contains(&needle), "{args:?}: {stdout}");
     }
 
     let output = run_ss(&["x"]);
