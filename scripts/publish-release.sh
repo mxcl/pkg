@@ -54,7 +54,7 @@ print(version.strip())
 PY
 )"
 
-bin_name="$(
+package_name="$(
   python - "$cargo_toml" <<'PY'
 import sys
 import tomllib
@@ -73,6 +73,32 @@ if not isinstance(name, str) or not name.strip():
     sys.exit(1)
 
 print(name.strip())
+PY
+)"
+
+bin_name="$(
+  python - "$cargo_toml" <<'PY'
+import sys
+import tomllib
+
+path = sys.argv[1]
+with open(path, "rb") as f:
+    data = tomllib.load(f)
+
+bins = data.get("bin", [])
+if not isinstance(bins, list):
+    sys.stderr.write("error: [[bin]] entries not found in Cargo.toml\n")
+    sys.exit(1)
+
+for entry in bins:
+    if isinstance(entry, dict):
+        name = entry.get("name")
+        if isinstance(name, str) and name.strip():
+            print(name.strip())
+            sys.exit(0)
+
+sys.stderr.write("error: binary name not found in Cargo.toml\n")
+sys.exit(1)
 PY
 )"
 
@@ -198,7 +224,7 @@ for target in "${targets[@]}"; do
     ;;
   esac
 
-  artifact="$bin_name-$v_new-$uname_s-$uname_m.tar.gz"
+  artifact="$package_name-$v_new-$uname_s-$uname_m.tar.gz"
   bin_file="$bin_name"
   if [[ "$target" == *-pc-windows-* ]]; then
     bin_file="$bin_file.exe"

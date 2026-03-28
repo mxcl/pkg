@@ -506,26 +506,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "p0r"
-version = "0.3.0"
-dependencies = [
- "flate2",
- "indicatif",
- "json5",
- "libc",
- "rayon",
- "semver",
- "serde",
- "serde_json",
- "sha2",
- "tar",
- "tempfile",
- "ureq",
- "urlencoding",
- "walkdir",
-]
-
-[[package]]
 name = "percent-encoding"
 version = "2.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -818,6 +798,26 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "substrate"
+version = "0.3.0"
+dependencies = [
+ "flate2",
+ "indicatif",
+ "json5",
+ "libc",
+ "rayon",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tar",
+ "tempfile",
+ "ureq",
+ "urlencoding",
+ "walkdir",
+]
 
 [[package]]
 name = "subtle"

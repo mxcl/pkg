@@ -1,5 +1,5 @@
 [package]
-name = "p0r"
+name = "substrate"
 version = "0.3.0"
 edition = "2024"
 autobins = false
@@ -8,8 +8,8 @@ autobins = false
 gold-release = []
 
 [[bin]]
-name = "p0r"
-path = "src/bin/p0r.rs"
+name = "ss"
+path = "src/bin/ss.rs"
 
 [dependencies]
 flate2 = "1"
