@@ -13,6 +13,7 @@ pub struct VendorPackage {
     pub install: fn(&Version) -> InstallStrategy,
 }
 
+#[derive(Clone)]
 pub enum InstallStrategy {
     NpmGlobal {
         package: String,
@@ -57,6 +58,16 @@ pub fn github_release_url(repo: &str, tag: &str, asset: &str) -> String {
 
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
+fn github_api_root() -> String {
+    std::env::var("PKG_GITHUB_API_ROOT")
+        .unwrap_or_else(|_| "https://api.github.com".to_string())
+}
+
+fn npm_registry_root() -> String {
+    std::env::var("PKG_NPM_REGISTRY_ROOT")
+        .unwrap_or_else(|_| "https://registry.npmjs.org".to_string())
+}
+
 #[derive(Deserialize)]
 struct GithubRelease {
     tag_name: String,
@@ -74,7 +85,7 @@ struct NpmDistTags {
 }
 
 pub fn github_latest_tag(repo: &str) -> Result<String, String> {
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("{}/repos/{repo}/releases/latest", github_api_root());
     let release: GithubRelease =
         fetch_json(&url, &format!("failed to fetch latest release for {repo}"))?;
     Ok(release.tag_name)
@@ -82,7 +93,8 @@ pub fn github_latest_tag(repo: &str) -> Result<String, String> {
 
 pub fn npm_latest_tag(package: &str) -> Result<String, String> {
     let url = format!(
-        "https://registry.npmjs.org/{}",
+        "{}/{}",
+        npm_registry_root(),
         urlencoding::encode(package)
     );
     let package: NpmPackageVersion =

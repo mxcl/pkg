@@ -113,6 +113,14 @@ const SAFE_BINARY_PATH_BYTES: &[u8] =
 static POST_INSTALL_CHECK_SKIP: OnceLock<HashSet<String>> = OnceLock::new();
 static FORMULA_ALIAS_INDEX: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
 
+fn formula_api_root() -> String {
+    env::var("PKG_FORMULA_API_ROOT").unwrap_or_else(|_| FORMULA_API_ROOT.to_string())
+}
+
+fn formula_api_index_url() -> String {
+    env::var("PKG_FORMULA_API_INDEX_URL").unwrap_or_else(|_| FORMULA_API_INDEX_URL.to_string())
+}
+
 #[derive(Debug, Deserialize)]
 struct Db {
     schema: u32,
@@ -318,7 +326,7 @@ struct PackageStatus {
     latest_version: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct StubManifest {
     stubs: Vec<String>,
 }
@@ -500,9 +508,17 @@ fn temp_root_for_target_root(
     shared_tmp_root: &Path,
 ) -> PathBuf {
     match paths_share_device(target_root, system_tmp_root) {
-        Ok(true) => shared_tmp_root.to_path_buf(),
+        Ok(true) if shared_tmp_root_is_writable(shared_tmp_root) => shared_tmp_root.to_path_buf(),
         Ok(false) | Err(_) => target_root.join(".tmp"),
+        Ok(true) => target_root.join(".tmp"),
     }
+}
+
+fn shared_tmp_root_is_writable(path: &Path) -> bool {
+    if fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    TempDir::new_in(path).is_ok()
 }
 
 fn paths_share_device(left: &Path, right: &Path) -> Result<bool, String> {
@@ -1123,6 +1139,16 @@ fn parse_x_request(
     invocation: &Invocation,
     args: &mut env::ArgsOs,
 ) -> Result<Option<XRequest>, String> {
+    parse_x_request_from_iter(invocation, args)
+}
+
+fn parse_x_request_from_iter<I>(
+    invocation: &Invocation,
+    mut args: I,
+) -> Result<Option<XRequest>, String>
+where
+    I: Iterator<Item = OsString>,
+{
     let Some(mut first_arg) = args.next() else {
         print_x_usage(&invocation.name);
         return Err("missing executable name".to_string());
@@ -3192,7 +3218,7 @@ fn fetch_formula_info_by_api_name(
     formula: &str,
     api_name: &str,
 ) -> Result<Option<FormulaInfo>, String> {
-    fetch_optional_json(&format!("{FORMULA_API_ROOT}/{api_name}.json"), || {
+    fetch_optional_json(&format!("{}/{api_name}.json", formula_api_root()), || {
         format!("failed to fetch formula metadata for {formula}")
     })
 }
@@ -3224,7 +3250,7 @@ fn formula_alias_index() -> Result<&'static HashMap<String, String>, String> {
 }
 
 fn build_formula_alias_index() -> Result<HashMap<String, String>, String> {
-    let entries: Vec<FormulaIndexEntry> = fetch_json(FORMULA_API_INDEX_URL, || {
+    let entries: Vec<FormulaIndexEntry> = fetch_json(&formula_api_index_url(), || {
         "failed to fetch Homebrew formula index".to_string()
     })?;
     Ok(collect_formula_aliases(entries))
@@ -4734,6 +4760,11 @@ fn is_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vendor::{
+        bun, clawhub, codex, deno, get, gh, github_release_url, node, openclaw, parse_semver,
+        qmd,
+    };
+    use semver::Version;
 
     fn test_db(entries: &[(&str, &str)]) -> Db {
         Db {
@@ -6752,6 +6783,23 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn temp_root_for_target_root_falls_back_when_shared_root_is_not_writable() {
+        let temp = TempDir::new().unwrap();
+        let target_root = temp.path().join("opt");
+        let system_tmp_root = temp.path().join("tmp");
+        let shared_tmp_root = temp.path().join("pkgtool");
+        fs::create_dir_all(&shared_tmp_root).unwrap();
+        let mut permissions = fs::metadata(&shared_tmp_root).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&shared_tmp_root, permissions).unwrap();
+
+        assert_eq!(
+            temp_root_for_target_root(&target_root, &system_tmp_root, &shared_tmp_root),
+            target_root.join(".tmp")
+        );
+    }
+
+    #[test]
     fn temp_root_for_target_root_falls_back_when_target_root_has_no_existing_ancestor() {
         let temp = TempDir::new().unwrap();
         let target_root = PathBuf::from("relative/opt");
@@ -6796,6 +6844,854 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         );
     }
 
+    #[test]
+    fn install_plan_paths_cover_dependency_layout_and_receipts() {
+        let plan = InstallPlan::for_x("rg".to_string());
+
+        assert_eq!(plan.actual_target_dir("rg"), PathBuf::from("/tmp/x/rg"));
+        assert_eq!(
+            plan.actual_target_dir("pcre2"),
+            PathBuf::from("/tmp/x/rg/pkgs/pcre2")
+        );
+        assert_eq!(plan.stable_target_dir("rg"), PathBuf::from("/tmp/x/rg"));
+        assert_eq!(
+            plan.stable_target_dir("pcre2"),
+            PathBuf::from("/tmp/x/rg/pkgs/pcre2")
+        );
+        assert_eq!(plan.receipt_path("rg"), PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json"));
+        assert_eq!(
+            plan.receipt_path("pcre2"),
+            PathBuf::from("/tmp/x/rg/pkgs/pcre2/.pkg/receipt.json")
+        );
+        assert_eq!(plan.package_manifest_path(), PathBuf::from("/tmp/x/rg/.pkg/stubs.json"));
+        assert_eq!(
+            plan.root_receipt_path(),
+            PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json")
+        );
+        assert_eq!(
+            plan.root_executables_manifest_path(),
+            PathBuf::from("/tmp/x/rg/.pkg/root-executables.json")
+        );
+    }
+
+    #[test]
+    fn metadata_probe_path_and_device_helpers_use_existing_ancestors() {
+        let temp = TempDir::new().unwrap();
+        let nested = temp.path().join("a/b/c");
+
+        assert_eq!(metadata_probe_path(&nested).unwrap(), temp.path());
+        assert!(paths_share_device(temp.path(), &nested).unwrap());
+    }
+
+    #[test]
+    fn load_db_and_schema_checks_embedded_inventory() {
+        let db = load_db().unwrap();
+        ensure_db_schema(&db).unwrap();
+        assert!(db.entries.contains_key("ffmpeg"));
+
+        let bad = Db {
+            schema: DB_SCHEMA_VERSION + 1,
+            generated_at: String::new(),
+            entries: HashMap::new(),
+        };
+        assert_eq!(
+            ensure_db_schema(&bad).unwrap_err(),
+            format!(
+                "unsupported db schema {} (expected {})",
+                DB_SCHEMA_VERSION + 1,
+                DB_SCHEMA_VERSION
+            )
+        );
+    }
+
+    #[test]
+    fn parse_x_request_supports_help_version_and_shebang_mode() {
+        let invocation = Invocation::for_subcommand("pkg", "x", Mode::X);
+
+        assert!(parse_x_request_from_iter(&invocation, vec![OsString::from("--help")].into_iter())
+            .unwrap()
+            .is_none());
+        assert!(parse_x_request_from_iter(
+            &invocation,
+            vec![OsString::from("--version")].into_iter(),
+        )
+        .unwrap()
+        .is_none());
+
+        let request = parse_x_request_from_iter(
+            &invocation,
+            vec![
+                OsString::from("--shebang"),
+                OsString::from("python@3.12"),
+                OsString::from("/tmp/script.py"),
+                OsString::from("--flag"),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(request.tool, "python");
+        assert_eq!(request.root_formula, "python@3.12");
+        assert_eq!(request.tool_args, vec![OsString::from("--flag")]);
+    }
+
+    #[test]
+    fn parse_x_request_supports_explicit_formulas_and_rejects_multiple_roots() {
+        let invocation = Invocation::for_subcommand("pkg", "x", Mode::X);
+
+        let explicit = parse_x_request_from_iter(
+            &invocation,
+            vec![
+                OsString::from("+ripgrep"),
+                OsString::from("rg"),
+                OsString::from("--version"),
+            ]
+            .into_iter(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(explicit.tool, "rg");
+        assert_eq!(explicit.root_formula, "ripgrep");
+        assert_eq!(explicit.tool_args, vec![OsString::from("--version")]);
+
+        assert_eq!(
+            parse_x_request_from_iter(
+                &invocation,
+                vec![
+                    OsString::from("+ripgrep"),
+                    OsString::from("+pcre2"),
+                    OsString::from("rg"),
+                ]
+                .into_iter(),
+            )
+            .unwrap_err(),
+            "supports a single root package".to_string()
+        );
+    }
+
+    #[test]
+    fn help_and_version_parse_paths_return_none() {
+        let invocation = Invocation {
+            binary_name: "pkg".to_string(),
+            name: "pkg update".to_string(),
+            mode: None,
+        };
+
+        assert_eq!(
+            parse_i_request_from_iter(&invocation, vec![OsString::from("-h")].into_iter()).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_uninstall_request_from_iter(&invocation, vec![OsString::from("--help")].into_iter())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_update_request_from_iter(&invocation, vec![OsString::from("-V")].into_iter())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_package_status_request_from_iter(
+                &invocation,
+                vec![OsString::from("--help")].into_iter(),
+                print_list_usage,
+            )
+            .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn flag_and_subcommand_helpers_accept_supported_aliases() {
+        assert!(is_help_flag(&OsString::from("-h")));
+        assert!(is_help_flag(&OsString::from("--help")));
+        assert!(is_version_flag(&OsString::from("-V")));
+        assert!(is_version_flag(&OsString::from("--version")));
+        assert!(is_force_flag(&OsString::from("-f")));
+        assert!(is_force_flag(&OsString::from("--force")));
+        assert!(is_shebang_flag(&OsString::from("-!")));
+        assert!(is_shebang_flag(&OsString::from("--shebang")));
+        assert!(is_no_self_update_flag(&OsString::from(SELF_UPDATE_DISABLE_FLAG)));
+        assert!(is_uninstall_subcommand("rm"));
+        assert!(is_uninstall_subcommand("uninstall"));
+        assert!(is_outdated_subcommand("outdated"));
+        assert!(!is_outdated_subcommand("list"));
+    }
+
+    #[test]
+    fn package_receipts_and_stub_manifests_round_trip() {
+        let temp = TempDir::new().unwrap();
+        let receipt_path = temp.path().join("pkg/root.json");
+        let stub_manifest_path = temp.path().join("pkg/stubs.json");
+        let root_manifest_path = temp.path().join("pkg/root-executables.json");
+        let receipt = PackageReceipt {
+            package_name: "deno".to_string(),
+            version: "2.7.7".to_string(),
+            source: PackageReceiptSource::Vendor {
+                vendor_name: "deno".to_string(),
+            },
+        };
+
+        assert!(load_package_receipt(&receipt_path).unwrap().is_none());
+        write_package_receipt(&receipt_path, &receipt).unwrap();
+        assert_eq!(load_package_receipt(&receipt_path).unwrap(), Some(receipt));
+
+        assert_eq!(
+            load_stub_manifest(&stub_manifest_path).unwrap(),
+            StubManifest { stubs: Vec::new() }
+        );
+        write_stub_manifest(
+            &stub_manifest_path,
+            &StubManifest {
+                stubs: vec!["deno".to_string()],
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_stub_manifest(&stub_manifest_path).unwrap(),
+            StubManifest {
+                stubs: vec!["deno".to_string()],
+            }
+        );
+
+        write_root_executable_manifest(&root_manifest_path, &["deno".to_string()]).unwrap();
+        assert_eq!(
+            load_root_executable_manifest(&root_manifest_path).unwrap(),
+            StubManifest {
+                stubs: vec!["deno".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn package_status_helpers_cover_current_and_missing_cases() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "sqlite".to_string(),
+            root_formula: "sqlite".to_string(),
+            stable_root: temp.path().join("opt/sqlite"),
+            install_root: temp.path().join("opt/sqlite"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        let install = InstalledFormula {
+            spec: FormulaSpec {
+                name: "sqlite".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/sqlite.tar.gz".to_string(),
+            },
+            keg_dir_name: "3.49.1".to_string(),
+            archive_path: temp.path().join("sqlite.tar.gz"),
+        };
+
+        assert!(!receipt_is_current(&plan, &install, "arm64_tahoe").unwrap());
+        assert!(!package_is_current(&plan, std::slice::from_ref(&install), "arm64_tahoe").unwrap());
+
+        write_receipt(&plan.receipt_path("sqlite"), &install, "arm64_tahoe").unwrap();
+        fs::create_dir_all(&plan.install_root).unwrap();
+        assert!(receipt_is_current(&plan, &install, "arm64_tahoe").unwrap());
+        assert!(package_is_current(&plan, &[install], "arm64_tahoe").unwrap());
+    }
+
+    #[test]
+    fn install_dependency_formulas_with_empty_graph_prepares_vendor_root() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "clawhub".to_string(),
+            root_formula: "clawhub".to_string(),
+            stable_root: temp.path().join("opt/clawhub"),
+            install_root: temp.path().join("opt/clawhub"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        fs::create_dir_all(&plan.install_root).unwrap();
+        fs::write(plan.install_root.join("stale"), b"old").unwrap();
+
+        install_dependency_formulas(
+            &Config {
+                bottle_tag: "arm64_tahoe".to_string(),
+            },
+            &plan,
+            &[],
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.install_root.is_dir());
+        assert!(!plan.install_root.join("stale").exists());
+    }
+
+    #[test]
+    fn dependency_current_checks_cover_empty_and_vendor_roots() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "codex".to_string(),
+            root_formula: "codex".to_string(),
+            stable_root: temp.path().join("opt/codex"),
+            install_root: temp.path().join("opt/codex"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        let config = Config {
+            bottle_tag: "arm64_tahoe".to_string(),
+        };
+
+        assert!(!dependencies_are_current(&plan, &[], &[], &config).unwrap());
+        fs::create_dir_all(&plan.install_root).unwrap();
+        assert!(dependencies_are_current(&plan, &[], &[], &config).unwrap());
+
+        fs::create_dir_all(plan.install_root.join("bin")).unwrap();
+        write_executable(&plan.install_root.join("bin/codex"));
+        let vendor_install = fake_vendor_install("codex", &["codex"], "0.1.0");
+        assert!(vendor_root_is_current(&plan, &vendor_install, &[], &config.bottle_tag).unwrap());
+
+        remove_path(&plan.install_root.join("bin/codex")).unwrap();
+        assert!(!vendor_root_is_current(&plan, &vendor_install, &[], &config.bottle_tag).unwrap());
+    }
+
+    #[test]
+    fn find_supported_post_install_prefixes_filters_supported_formula_receipts() {
+        let temp = TempDir::new().unwrap();
+        let opt_root = temp.path().join("opt");
+        let python = opt_root.join("python@3.12");
+        let openssl = opt_root.join("openssl@3");
+        let deno = opt_root.join("deno");
+        fs::create_dir_all(&python).unwrap();
+        fs::create_dir_all(&openssl).unwrap();
+        fs::create_dir_all(&deno).unwrap();
+
+        write_package_receipt(
+            &python.join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "python@3.12".to_string(),
+                version: "3.12.10".to_string(),
+                source: PackageReceiptSource::Formula {
+                    root_formula: "python@3.12".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        write_package_receipt(
+            &openssl.join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "openssl@3".to_string(),
+                version: "3.6.1".to_string(),
+                source: PackageReceiptSource::Formula {
+                    root_formula: "openssl@3".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        write_package_receipt(
+            &deno.join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "deno".to_string(),
+                version: "2.7.7".to_string(),
+                source: PackageReceiptSource::Vendor {
+                    vendor_name: "deno".to_string(),
+                },
+            },
+        )
+        .unwrap();
+
+        let mut prefixes = find_supported_post_install_prefixes(&opt_root).unwrap();
+        prefixes.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(
+            prefixes,
+            vec![
+                ("openssl@3".to_string(), openssl),
+                ("python@3.12".to_string(), python),
+            ]
+        );
+        assert_eq!(installed_post_install_formula(&deno, "deno").unwrap(), None);
+    }
+
+    #[test]
+    fn post_install_helpers_cover_python_and_openssl_branches() {
+        let temp = TempDir::new().unwrap();
+        let opt_root = temp.path().join("opt");
+        let bin_dir = temp.path().join("bin");
+        let python312 = opt_root.join("python@3.12");
+        let python313 = opt_root.join("python@3.13");
+        fs::create_dir_all(&python312).unwrap();
+        fs::create_dir_all(&python313).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_executable(&bin_dir.join("python3.12"));
+        write_executable(&bin_dir.join("pip3.12"));
+        fs::write(bin_dir.join("python3"), b"old").unwrap();
+        assert!(post_install_hooks::supports("python@3.12"));
+        assert!(!post_install_hooks::supports("python@3.12.1"));
+        let outcome = post_install_hooks::run("python@3.12", &python312, &bin_dir).unwrap();
+        assert_eq!(
+            outcome.managed_stubs,
+            vec![
+                "pip".to_string(),
+                "pip3".to_string(),
+                "python".to_string(),
+                "python3".to_string(),
+            ]
+        );
+        assert_eq!(fs::read_link(bin_dir.join("python3")).unwrap(), bin_dir.join("python3.12"));
+
+        let openssl_prefix = temp.path().join("openssl");
+        let source_dir = openssl_prefix.join(OPENSSL_CA_CERTIFICATES_DIR);
+        let target_dir = openssl_prefix.join(OPENSSL_CERT_PEM_DESTINATION_DIR);
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&target_dir).unwrap();
+        fs::write(source_dir.join("cacert.pem"), b"source").unwrap();
+        fs::write(source_dir.join("extra.pem"), b"extra").unwrap();
+        fs::write(target_dir.join("cert.pem"), b"old").unwrap();
+
+        assert!(post_install_hooks::supports_dependency("openssl@3"));
+        post_install_hooks::run("openssl@3", &openssl_prefix, &bin_dir).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(target_dir.join("cert.pem")).unwrap(),
+            "source"
+        );
+        assert_eq!(
+            fs::read_to_string(target_dir.join("extra.pem")).unwrap(),
+            "extra"
+        );
+        assert!(!source_dir.exists());
+    }
+
+    #[test]
+    fn vendor_registry_helpers_cover_install_strategies_and_parse_errors() {
+        assert!(get("missing").is_none());
+        assert_eq!(
+            github_release_url("foo/bar", "v1.2.3", "tool.tar.gz"),
+            "https://github.com/foo/bar/releases/download/v1.2.3/tool.tar.gz"
+        );
+        assert!(parse_semver("nope", "test").is_err());
+
+        match deno::install(&Version::parse("2.7.7").unwrap()) {
+            vendor::InstallStrategy::CopyFile {
+                source,
+                destination_dir,
+                destination_name,
+                mode,
+                create_dirs,
+            } => {
+                assert_eq!(source, "deno");
+                assert_eq!(destination_dir, "bin");
+                assert_eq!(destination_name, None);
+                assert_eq!(mode, 0o755);
+                assert_eq!(create_dirs, vec!["bin".to_string()]);
+            }
+            _ => panic!("deno should install a single binary"),
+        }
+
+        match gh::install(&Version::parse("2.88.1").unwrap()) {
+            vendor::InstallStrategy::CopyFile { source, .. } => {
+                assert_eq!(source, "gh_2.88.1_macOS_arm64/bin/gh");
+            }
+            _ => panic!("gh should install a single binary"),
+        }
+
+        match node::install(&Version::parse("22.18.0").unwrap()) {
+            vendor::InstallStrategy::CopyTree { source } => {
+                assert_eq!(source, "node-v22.18.0-darwin-arm64");
+            }
+            _ => panic!("node should install a tree"),
+        }
+
+        match clawhub::install(&Version::parse("1.2.3").unwrap()) {
+            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "clawhub"),
+            _ => panic!("clawhub should install with npm"),
+        }
+        match openclaw::install(&Version::parse("1.2.3").unwrap()) {
+            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "openclaw"),
+            _ => panic!("openclaw should install with npm"),
+        }
+        match qmd::install(&Version::parse("1.2.3").unwrap()) {
+            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "@tobilu/qmd"),
+            _ => panic!("qmd should install with npm"),
+        }
+    }
+
+    #[test]
+    fn formula_api_helpers_resolve_aliases_and_specs_from_fixture_server() {
+        let _env_lock = test_env_lock().lock().unwrap();
+        let (base, server) = start_test_http_server(
+            vec![
+                (
+                    "/formula.json".to_string(),
+                    serde_json::to_vec(&vec![
+                        serde_json::json!({
+                            "name": "python@3.12",
+                            "aliases": ["python"],
+                            "oldnames": ["python3.12"],
+                        }),
+                        serde_json::json!({
+                            "name": "openssl@3",
+                            "aliases": [],
+                            "oldnames": [],
+                        }),
+                    ])
+                    .unwrap(),
+                ),
+                (
+                    "/python@3.12.json".to_string(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "versions": {"stable": "3.12.10"},
+                        "revision": 1,
+                        "dependencies": ["openssl@3"],
+                        "bottle": {
+                            "stable": {
+                                "files": {
+                                    "arm64_tahoe": {
+                                        "sha256": "python-sha",
+                                        "url": "https://example.invalid/python.tar.gz"
+                                    }
+                                }
+                            }
+                        },
+                        "disabled": false,
+                        "post_install_defined": false
+                    }))
+                    .unwrap(),
+                ),
+                (
+                    "/openssl@3.json".to_string(),
+                    serde_json::to_vec(&serde_json::json!({
+                        "versions": {"stable": "3.6.1"},
+                        "revision": 0,
+                        "dependencies": [],
+                        "bottle": {
+                            "stable": {
+                                "files": {
+                                    "arm64_tahoe": {
+                                        "sha256": "openssl-sha",
+                                        "url": "https://example.invalid/openssl.tar.gz"
+                                    }
+                                }
+                            }
+                        },
+                        "disabled": false,
+                        "post_install_defined": true
+                    }))
+                    .unwrap(),
+                ),
+            ],
+            8,
+        );
+        let _env = TestEnvGuard::set(&[
+            ("PKG_FORMULA_API_ROOT", &base),
+            ("PKG_FORMULA_API_INDEX_URL", &format!("{base}/formula.json")),
+        ]);
+
+        assert_eq!(canonical_formula_name("python").unwrap(), "python@3.12");
+        assert!(formula_metadata_exists("python").unwrap());
+        assert_eq!(
+            formula_version_string(&fetch_formula_info("python").unwrap()),
+            "3.12.10_1"
+        );
+        assert_eq!(
+            resolve_formula_latest_version(
+                &Config {
+                    bottle_tag: "arm64_tahoe".to_string(),
+                },
+                "python",
+            )
+            .unwrap(),
+            "3.12.10_1"
+        );
+        let specs = resolve_formula_specs(
+            &["python".to_string()],
+            &Config {
+                bottle_tag: "arm64_tahoe".to_string(),
+            },
+            true,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(
+            specs.iter().map(|spec| spec.name.as_str()).collect::<Vec<_>>(),
+            vec!["openssl@3", "python@3.12"]
+        );
+    }
+
+    #[test]
+    fn vendor_version_fetchers_use_fixture_metadata_servers() {
+        let _env_lock = test_env_lock().lock().unwrap();
+        let (base, server) = start_test_http_server(
+            vec![
+                (
+                    "/repos/oven-sh/bun/releases/latest".to_string(),
+                    br#"{"tag_name":"bun-v1.2.3"}"#.to_vec(),
+                ),
+                (
+                    "/repos/openai/codex/releases/latest".to_string(),
+                    br#"{"tag_name":"rust-v0.116.0"}"#.to_vec(),
+                ),
+                (
+                    "/repos/denoland/deno/releases/latest".to_string(),
+                    br#"{"tag_name":"v2.7.7"}"#.to_vec(),
+                ),
+                (
+                    "/repos/cli/cli/releases/latest".to_string(),
+                    br#"{"tag_name":"v2.88.1"}"#.to_vec(),
+                ),
+                (
+                    "/repos/nodejs/node/releases/latest".to_string(),
+                    br#"{"tag_name":"v22.18.0"}"#.to_vec(),
+                ),
+                (
+                    "/repos/tobi/qmd/releases/latest".to_string(),
+                    br#"{"tag_name":"v0.1.0"}"#.to_vec(),
+                ),
+                (
+                    "/clawhub".to_string(),
+                    br#"{"dist-tags":{"latest":"1.2.3"}}"#.to_vec(),
+                ),
+                (
+                    "/openclaw".to_string(),
+                    br#"{"dist-tags":{"latest":"4.5.6"}}"#.to_vec(),
+                ),
+            ],
+            8,
+        );
+        let _env = TestEnvGuard::set(&[
+            ("PKG_GITHUB_API_ROOT", &base),
+            ("PKG_NPM_REGISTRY_ROOT", &base),
+        ]);
+
+        assert_eq!(bun::version().unwrap(), Version::parse("1.2.3").unwrap());
+        assert_eq!(codex::version().unwrap(), Version::parse("0.116.0").unwrap());
+        assert_eq!(deno::version().unwrap(), Version::parse("2.7.7").unwrap());
+        assert_eq!(gh::version().unwrap(), Version::parse("2.88.1").unwrap());
+        assert_eq!(node::version().unwrap(), Version::parse("22.18.0").unwrap());
+        assert_eq!(qmd::version().unwrap(), Version::parse("0.1.0").unwrap());
+        assert_eq!(clawhub::version().unwrap(), Version::parse("1.2.3").unwrap());
+        assert_eq!(openclaw::version().unwrap(), Version::parse("4.5.6").unwrap());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn download_and_install_helpers_handle_local_archives() {
+        let temp = TempDir::new().unwrap();
+        let tmp_root = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_root).unwrap();
+
+        let bottle_archive = temp.path().join("sqlite.tar.gz");
+        write_test_bottle_archive(
+            &bottle_archive,
+            "sqlite",
+            "3.49.1",
+            &[("bin/sqlite3", b"#!/bin/sh\n")],
+        );
+        let bottle_bytes = fs::read(&bottle_archive).unwrap();
+        let bottle_sha = format!("{:x}", Sha256::digest(&bottle_bytes));
+        let (bottle_base, bottle_server) = start_test_http_server(
+            vec![("/sqlite.tar.gz".to_string(), bottle_bytes.clone())],
+            1,
+        );
+        let bottle_spec = FormulaSpec {
+            name: "sqlite".to_string(),
+            bottle_sha256: bottle_sha,
+            bottle_url: format!("{bottle_base}/sqlite.tar.gz"),
+        };
+
+        let state =
+            resolve_dependency_install_state(std::slice::from_ref(&bottle_spec), &tmp_root, None)
+                .unwrap();
+        bottle_server.join().unwrap();
+        assert_eq!(state.installs.len(), 1);
+        assert_eq!(state.installs[0].keg_dir_name, "3.49.1");
+
+        let vendor_archive = temp.path().join("vendor.tar.gz");
+        write_test_archive(
+            &vendor_archive,
+            &[("pkg/bin/tool", b"#!/bin/sh\n"), ("pkg/share/doc.txt", b"hello\n")],
+        );
+        let vendor_bytes = fs::read(&vendor_archive).unwrap();
+        let (vendor_base, vendor_server) = start_test_http_server(
+            vec![("/vendor.tar.gz".to_string(), vendor_bytes)],
+            2,
+        );
+
+        let copy_file_version = Version::parse("9.8.7").unwrap();
+        register_test_download_url(
+            &copy_file_version,
+            format!("{vendor_base}/vendor.tar.gz"),
+        );
+        let copy_tree_version = Version::parse("9.8.8").unwrap();
+        register_test_download_url(
+            &copy_tree_version,
+            format!("{vendor_base}/vendor.tar.gz"),
+        );
+
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "tool".to_string(),
+            root_formula: "tool".to_string(),
+            stable_root: temp.path().join("opt/tool"),
+            install_root: temp.path().join("opt/tool"),
+            tmp_root: tmp_root.clone(),
+        };
+        fs::create_dir_all(&plan.install_root).unwrap();
+
+        let copy_file_install = VendorInstall {
+            package: vendor::VendorPackage {
+                name: "tool",
+                dependencies: &[],
+                executables: &["tool"],
+                version: fake_vendor_version,
+                download_url: Some(test_download_url),
+                install: fake_vendor_install_strategy,
+            },
+            version: copy_file_version,
+        };
+        install_vendor_copy_file(
+            &plan,
+            &[],
+            &copy_file_install,
+            "pkg/bin/tool",
+            "bin",
+            Some("tool"),
+            0o755,
+            &["bin".to_string()],
+            None,
+        )
+        .unwrap();
+        assert!(is_executable(&plan.install_root.join("bin/tool")));
+
+        let tree_plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "tree".to_string(),
+            root_formula: "tree".to_string(),
+            stable_root: temp.path().join("opt/tree"),
+            install_root: temp.path().join("opt/tree"),
+            tmp_root,
+        };
+        fs::create_dir_all(&tree_plan.install_root).unwrap();
+        let copy_tree_install = VendorInstall {
+            package: vendor::VendorPackage {
+                name: "tree",
+                dependencies: &[],
+                executables: &["tool"],
+                version: fake_vendor_version,
+                download_url: Some(test_download_url),
+                install: fake_vendor_install_strategy,
+            },
+            version: copy_tree_version,
+        };
+        install_vendor_copy_tree(&tree_plan, &copy_tree_install, "pkg", None).unwrap();
+        vendor_server.join().unwrap();
+        assert!(tree_plan.install_root.join("bin/tool").is_file());
+        assert!(tree_plan.install_root.join("share").is_dir());
+    }
+
+    #[test]
+    fn install_package_and_command_helpers_cover_end_to_end_staging() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::X,
+            package_name: "sqlite".to_string(),
+            root_formula: "sqlite".to_string(),
+            stable_root: temp.path().join("x/sqlite"),
+            install_root: temp.path().join("x/sqlite"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        ensure_plan_parent_dirs(&plan).unwrap();
+
+        let archive = temp.path().join("sqlite.tar.gz");
+        write_test_bottle_archive(
+            &archive,
+            "sqlite",
+            "3.49.1",
+            &[("bin/sqlite3", b"#!/bin/sh\n"), ("share/doc.txt", b"hello\n")],
+        );
+        let install = InstalledFormula {
+            spec: FormulaSpec {
+                name: "sqlite".to_string(),
+                bottle_sha256: "sha256".to_string(),
+                bottle_url: "https://example.invalid/sqlite.tar.gz".to_string(),
+            },
+            keg_dir_name: "3.49.1".to_string(),
+            archive_path: archive,
+        };
+        let config = Config {
+            bottle_tag: "arm64_tahoe".to_string(),
+        };
+        let graph = vec![install.spec.clone()];
+        let rewrite_rules = build_rewrite_rules(&plan, std::slice::from_ref(&install));
+
+        install_package(
+            &config,
+            &plan,
+            std::slice::from_ref(&install),
+            &rewrite_rules,
+            None,
+        )
+        .unwrap();
+
+        assert!(plan.install_root.join("bin/sqlite3").is_file());
+        assert!(plan.install_root.join("share/doc.txt").is_file());
+        assert!(package_is_current(&plan, &[install], &config.bottle_tag).unwrap());
+        assert_eq!(build_formula_order(&plan, &graph), vec!["sqlite".to_string()]);
+        assert_eq!(
+            find_executable_in_package(&plan, &graph, "sqlite3").unwrap(),
+            plan.install_root.join("bin/sqlite3")
+        );
+        assert_eq!(
+            resolve_install_time_command(&plan, &graph, "sqlite3").unwrap(),
+            plan.install_root.join("bin/sqlite3")
+        );
+    }
+
+    #[test]
+    fn path_and_process_helpers_cover_remaining_utility_branches() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("readonly");
+        fs::write(&path, b"text").unwrap();
+        let mut permissions = fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o555);
+        fs::set_permissions(&path, permissions).unwrap();
+        ensure_writable(&path).unwrap();
+        assert_ne!(fs::metadata(&path).unwrap().permissions().mode() & 0o200, 0);
+
+        assert_eq!(
+            normalize_path(Path::new("/opt/homebrew/Cellar/../opt/./sqlite")),
+            PathBuf::from("/opt/homebrew/opt/sqlite")
+        );
+        assert_eq!(
+            relative_path_from(Path::new("/opt/sqlite/bin"), Path::new("/opt/sqlite/share/doc")),
+            PathBuf::from("../share/doc")
+        );
+        assert_eq!(
+            relative_path_from(Path::new("relative"), Path::new("/absolute/path")),
+            PathBuf::from("/absolute/path")
+        );
+        assert_eq!(
+            source_keg_root(Path::new("/tmp/root/sqlite/3.49.1")).unwrap(),
+            PathBuf::from("/opt/homebrew/Cellar/sqlite/3.49.1")
+        );
+        assert_eq!(
+            homebrew_relative_symlink_source(Path::new("/opt/homebrew/opt/sqlite/bin/sqlite3")),
+            Some("@@HOMEBREW_PREFIX@@/opt/sqlite/bin/sqlite3".to_string())
+        );
+        assert_eq!(
+            homebrew_relative_symlink_source(Path::new("/opt/homebrew/Cellar/sqlite/3.49.1/bin/sqlite3")),
+            Some("@@HOMEBREW_CELLAR@@/sqlite/3.49.1/bin/sqlite3".to_string())
+        );
+        assert!(!is_macho(b"abc"));
+        assert!(codesign_if_macho(Path::new("/tmp/not-macho"), b"#!/bin/sh\n", None).is_ok());
+
+        let mut command = Command::new("/bin/sh");
+        command.arg("-c").arg("printf 'hello\\n'; printf 'warn\\n' >&2");
+        let output = run_command_with_logged_output(&mut command, None, "test command").unwrap();
+        assert!(output.status.success());
+        assert!(output.lines.iter().any(|line| line == "hello"));
+        assert!(output.lines.iter().any(|line| line == "warn"));
+        assert_eq!(
+            format_command_output_suffix(&["".to_string(), "warn".to_string()]),
+            ": warn".to_string()
+        );
+    }
+
     fn fake_vendor_version() -> Result<semver::Version, String> {
         Ok(semver::Version::parse("0.0.0").unwrap())
     }
@@ -6804,6 +7700,68 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         vendor::InstallStrategy::CopyTree {
             source: "ignored".to_string(),
         }
+    }
+
+    static TEST_DOWNLOAD_URLS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    static TEST_ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    struct TestEnvGuard {
+        previous: Vec<(String, Option<OsString>)>,
+    }
+
+    impl TestEnvGuard {
+        fn set(values: &[(&str, &str)]) -> Self {
+            let previous = values
+                .iter()
+                .map(|(key, value)| {
+                    let previous = env::var_os(key);
+                    unsafe {
+                        env::set_var(key, value);
+                    }
+                    ((*key).to_string(), previous)
+                })
+                .collect();
+            Self { previous }
+        }
+    }
+
+    impl Drop for TestEnvGuard {
+        fn drop(&mut self) {
+            for (key, previous) in self.previous.drain(..).rev() {
+                match previous {
+                    Some(value) => unsafe {
+                        env::set_var(&key, value);
+                    },
+                    None => unsafe {
+                        env::remove_var(&key);
+                    },
+                }
+            }
+        }
+    }
+
+    fn test_env_lock() -> &'static Mutex<()> {
+        TEST_ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn test_download_urls() -> &'static Mutex<HashMap<String, String>> {
+        TEST_DOWNLOAD_URLS.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn register_test_download_url(version: &Version, url: String) {
+        test_download_urls()
+            .lock()
+            .unwrap()
+            .insert(version.to_string(), url);
+    }
+
+    fn test_download_url(version: &Version) -> String {
+        test_download_urls()
+            .lock()
+            .unwrap()
+            .get(&version.to_string())
+            .cloned()
+            .unwrap()
     }
 
     fn fake_vendor_install(
@@ -6847,5 +7805,55 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         let encoder = archive.into_inner().unwrap();
         encoder.finish().unwrap();
+    }
+
+    fn write_test_archive(archive_path: &Path, files: &[(&str, &[u8])]) {
+        let file = File::create(archive_path).unwrap();
+        let encoder = flate2::write::GzEncoder::new(file, flate2::Compression::default());
+        let mut archive = tar::Builder::new(encoder);
+
+        for (path, contents) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(contents.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive.append_data(&mut header, *path, *contents).unwrap();
+        }
+
+        let encoder = archive.into_inner().unwrap();
+        encoder.finish().unwrap();
+    }
+
+    fn start_test_http_server(
+        routes: Vec<(String, Vec<u8>)>,
+        requests: usize,
+    ) -> (String, thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let address = listener.local_addr().unwrap();
+        let routes = Arc::new(routes.into_iter().collect::<HashMap<_, _>>());
+        let handle = thread::spawn(move || {
+            for _ in 0..requests {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let count = stream.read(&mut buffer).unwrap();
+                let request = String::from_utf8_lossy(&buffer[..count]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap();
+                let (status, body) = match routes.get(path) {
+                    Some(body) => ("200 OK", body.clone()),
+                    None => ("404 Not Found", Vec::new()),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(&body).unwrap();
+            }
+        });
+        (format!("http://{address}"), handle)
     }
 }
