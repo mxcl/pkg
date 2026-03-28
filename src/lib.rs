@@ -2875,12 +2875,12 @@ fn print_pkg_usage(program: &str) {
     println!("Usage: {program} <subcommand> [args...]");
     println!();
     println!("Subcommands:");
-    println!("  run, x       Run Homebrew executables ephemerally.");
-    println!("  install, i   Install a self-contained package.");
-    println!("  list, ls     List installed packages with their versions.");
-    println!("  outdated     List installed packages with updates available.");
-    println!("  update       Reinstall installed packages with updates available.");
-    println!("  uninstall, rm Remove an installed package.");
+    println!("  run, x         Run Homebrew executables ephemerally.");
+    println!("  install, i     Install a self-contained package.");
+    println!("  list, ls       List installed packages with their versions.");
+    println!("  outdated       List installed packages with updates available.");
+    println!("  update, up     Reinstall installed packages with updates available.");
+    println!("  uninstall, rm  Remove an installed package.");
 }
 
 fn print_mode_usage(mode: Mode, program: &str) {
@@ -2919,7 +2919,7 @@ fn is_outdated_subcommand(value: &str) -> bool {
 }
 
 fn is_update_subcommand(value: &str) -> bool {
-    value == "update"
+    matches!(value, "update" | "up")
 }
 
 fn is_list_subcommand(value: &str) -> bool {
