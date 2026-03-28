@@ -38,7 +38,7 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/the-package-managinat0r | sudo t
 $ p0r run zopflipng in.png out.png  # alias: x
 ## ^^ emphermeral; downloads fresh every time
 
-$ sudo p0r install openclaw
+$ sudo p0r install npm:openclaw
 /usr/local/bin/openclaw
 # ^^ humans don’t let Claws modify themselves
 
@@ -62,32 +62,16 @@ That’s fine. I like it. I think it's good. Maybe you will too.
 
 ## Caveats
 
-- Mostly we are not going to package things from eg. `npm`, so you will need
-  to `p0r run npx`.
-  > [!NOTE]
-  > Having said this; We recommend that you not `npm install -g` anything:
-  > `npm` is not a package manager: it’s a dependency manager.
-- We make exceptions arbitarily
-  - eg. OpenClaw is a special case because we do not think it’s a great idea
-    to let OpenClaw modify.
-- `p0r run` always does an update check unless you run with a specific
-  version, eg. `p0r run zopflipng@1.0.3 …`
-  - notably `npx` does not behave this way and requires eg. `npx foo@latest`
-    but we do not have the same scope—all our packages are ephemeral
-- Homebrew formula with:
-  - `post_install` steps are not supported via `p0r install` or `p0r run`
-  - `pre_install` steps are not supported via `p0r install` or `p0r run`
-  We may figure out how to support these. But for now we’re just not going to
-  do this because we assume we will screw it up.
-- `service` metadata does not block installs, but `p0r` does not manage
-  those services for you. The service plist is in `/opt/foo` if you want.
-
-### Caveats Relative to Brew Specifically
-
+- `p0r run` is ephemeral. It always downloads and it always downloads the
+  latest version unless you specify, eg. `p0r run zopflipng@1.0.3 …`
+  > This is a feature. We are operating in an agentic world where agents
+  > can literally modify binaries if they want to be malicious. Everything
+  > must be installed by a human and if not then the tool that is installed
+  > by root that is executing things should never trust a user-writable cache
+- there is no `p0r services` command. Use `brew`.
+- some Homebrew formulae are not supported. If you come across them, report
+  this as a bug.
 - We do not and will likely never support casks.
-- Many vast formula like imagemagick-full and ffmpeg-full just aint gunna
-  install until we go through all the deps with complex install hooks and
-  rewrite them to be more self contained. We may never do this.
 
 ## Why Did You Do This?
 
