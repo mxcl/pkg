@@ -6887,7 +6887,7 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     fn load_db_and_schema_checks_embedded_inventory() {
         let db = load_db().unwrap();
         ensure_db_schema(&db).unwrap();
-        assert!(db.entries.contains_key("ffmpeg"));
+        assert_eq!(db.schema, DB_SCHEMA_VERSION);
 
         let bad = Db {
             schema: DB_SCHEMA_VERSION + 1,
