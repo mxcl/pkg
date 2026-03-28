@@ -7,6 +7,8 @@
   "fontconfig", //TODO regenerates the font cache (probs is fine to not…?)
   "gnutls", //TODO yeah we need to reimplement or do a more general fix for cert.pem checks
   "unbound", //TODO https://github.com/Homebrew/homebrew-core/blob/61659a355b44ff685a0338c8ad9fa24e04575155/Formula/u/unbound.rb#L59
+  "librsvg", //TODO https://github.com/Homebrew/homebrew-core/blob/b57a52a47643553c66a2965a30f167181e9972c3/Formula/lib/librsvg.rb
+  "gdk-pixbuf", //TODO https://github.com/Homebrew/homebrew-core/blob/a5ef1fec008b0d214be193ac59e9ce12a62824bc/Formula/g/gdk-pixbuf.rb#L85
 
   // leave last so we can add trailing commas to new entries above
   "openssl@3"
