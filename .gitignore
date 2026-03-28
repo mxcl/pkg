@@ -1,4 +1,4 @@
 /target
 /cache
-/pkg-*.tar.gz
+/substrate-*.tar.gz
 /data/db.json

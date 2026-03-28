@@ -2316,9 +2316,7 @@ fn self_update_asset_name_for(version: &semver::Version, os: &str, arch: &str) -
         "x86_64" => "x86_64",
         _ => return None,
     };
-    Some(format!(
-        "substrate-{version}-{os}-{arch}.tar.gz"
-    ))
+    Some(format!("substrate-{version}-{os}-{arch}.tar.gz"))
 }
 
 #[cfg(feature = "gold-release")]
