@@ -30,7 +30,8 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/the-package-managinat0r | sudo t
   contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
 - `p0r run PKG` can run anything ephemerally (downloads fresh every time)
-- Agent focused, eg. we package openclaw, clawhub and `qmd`
+- Agent focused, eg. we package `qmd` and support npm installs like
+  `npm:openclaw`
 
 ## Usage
 
@@ -42,7 +43,7 @@ $ sudo p0r install npm:openclaw
 /usr/local/bin/openclaw
 # ^^ humans don’t let Claws modify themselves
 
-$ sudo p0r uninstall openclaw  # alias: rm
+$ sudo p0r uninstall npm:openclaw  # alias: rm
 
 $ p0r list  # alias: ls
 

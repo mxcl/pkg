@@ -123,8 +123,6 @@ where
 
 #[path = "../vendor/bun.rs"]
 pub mod bun;
-#[path = "../vendor/clawhub.rs"]
-pub mod clawhub;
 #[path = "../vendor/codex.rs"]
 pub mod codex;
 #[path = "../vendor/deno.rs"]
@@ -133,19 +131,15 @@ pub mod deno;
 pub mod gh;
 #[path = "../vendor/node.rs"]
 pub mod node;
-#[path = "../vendor/openclaw.rs"]
-pub mod openclaw;
 #[path = "../vendor/qmd.rs"]
 pub mod qmd;
 
 pub static PACKAGES: &[&VendorEntry] = &[
     &bun::ENTRY,
-    &clawhub::ENTRY,
     &codex::ENTRY,
     &deno::ENTRY,
     &gh::ENTRY,
     &node::ENTRY,
-    &openclaw::ENTRY,
     &qmd::ENTRY,
 ];
 
@@ -165,23 +159,16 @@ mod tests {
     fn vendor_registry_contains_all_packages() {
         let mut names = PACKAGES.iter().map(|entry| entry.name).collect::<Vec<_>>();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            vec![
-                "bun", "clawhub", "codex", "deno", "gh", "node", "openclaw", "qmd"
-            ]
-        );
+        assert_eq!(names, vec!["bun", "codex", "deno", "gh", "node", "qmd"]);
     }
 
     #[test]
     fn vendor_packages_expose_executables() {
         assert_eq!(get("bun").unwrap().executables, ["bun"]);
-        assert_eq!(get("clawhub").unwrap().executables, ["clawhub"]);
         assert_eq!(get("codex").unwrap().executables, ["codex"]);
         assert_eq!(get("deno").unwrap().executables, ["deno"]);
         assert_eq!(get("gh").unwrap().executables, ["gh"]);
         assert_eq!(get("node").unwrap().executables, ["node", "npm", "npx"]);
-        assert_eq!(get("openclaw").unwrap().executables, ["openclaw"]);
         assert_eq!(get("qmd").unwrap().executables, ["qmd"]);
     }
 

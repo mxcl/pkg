@@ -262,6 +262,7 @@ struct XRequest {
 enum RequestedPackage {
     Auto(String),
     HomebrewFormula(String),
+    NpmPackage(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -322,6 +323,7 @@ struct PackageReceipt {
 enum PackageReceiptSource {
     Formula { root_formula: String },
     Vendor { vendor_name: String },
+    Npm { package_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -884,6 +886,7 @@ fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> R
         RequestedPackage::HomebrewFormula(formula) => {
             run_i_formula(config, formula.clone(), formula)
         }
+        RequestedPackage::NpmPackage(npm_package) => run_i_npm(config, package_name, npm_package),
     }
 }
 
@@ -1237,6 +1240,110 @@ fn run_i_vendor(
     }
 }
 
+fn run_i_npm(config: &Config, package_name: String, npm_package: String) -> Result<(), String> {
+    let progress = InstallProgress::new(&package_name);
+    let result = (|| {
+        let plan = InstallPlan::for_i(package_name.clone(), package_name.clone());
+        let previous_stubs = load_stub_manifest(&plan.package_manifest_path())?.stubs;
+        let (staged_plan, _staging_workspace) = prepare_i_install_plan(&plan)?;
+        let version = resolve_npm_package_version(&npm_package)?;
+        let executable = npm_package_executable_name(&npm_package);
+        let dependencies = resolve_vendor_dependency_specs(&["node"], config, false)?;
+        let dependency_state = resolve_dependency_install_state(
+            &dependencies.formula_graph,
+            &staged_plan.tmp_root,
+            Some(&progress),
+        )?;
+        ensure_plan_parent_dirs(&staged_plan)?;
+
+        let dependency_current = dependencies_are_current(
+            &staged_plan,
+            &dependency_state.installs,
+            &dependencies.vendor_installs,
+            config,
+        )?;
+        let mut dependencies_reinstalled = false;
+        if !dependency_current {
+            progress.begin_install_phase();
+            install_dependency_formulas(
+                config,
+                &staged_plan,
+                &dependency_state.installs,
+                Some(&progress),
+            )?;
+            install_vendor_dependencies(
+                &staged_plan,
+                &dependencies.formula_graph,
+                &dependencies.vendor_installs,
+                Some(&progress),
+            )?;
+            dependencies_reinstalled = true;
+        }
+
+        if !npm_root_is_current(
+            &staged_plan,
+            &executable,
+            &version,
+            &dependency_state.installs,
+            &config.bottle_tag,
+        )? {
+            if !dependencies_reinstalled {
+                if dependencies.formula_graph.is_empty() && dependencies.vendor_installs.is_empty()
+                {
+                    prepare_vendor_root_area(&staged_plan)?;
+                } else {
+                    reinstall_vendor_dependency_tree(
+                        config,
+                        &staged_plan,
+                        &dependency_state.installs,
+                        &dependencies.formula_graph,
+                        &dependencies.vendor_installs,
+                        Some(&progress),
+                    )?;
+                }
+            }
+            install_npm_root(
+                &staged_plan,
+                &dependencies.formula_graph,
+                &package_name,
+                &npm_package,
+                &version,
+                Some(&progress),
+            )?;
+        }
+
+        activate_install(&staged_plan)?;
+        write_package_receipt(
+            &plan.root_receipt_path(),
+            &PackageReceipt {
+                package_name: package_name.clone(),
+                version: version.to_string(),
+                source: PackageReceiptSource::Npm {
+                    package_name: npm_package.clone(),
+                },
+            },
+        )?;
+        sync_declared_stubs(
+            &plan,
+            &dependencies.formula_graph,
+            [executable.as_str()],
+            &previous_stubs,
+        )?;
+        installed_stub_paths(&plan)
+    })();
+
+    match result {
+        Ok(paths) => {
+            progress.finish_with_paths(&paths);
+            Ok(())
+        }
+        Err(err) => {
+            progress.clear();
+            Err(err)
+        }
+    }
+}
+
 fn parse_x_request(
     invocation: &Invocation,
     args: &mut env::ArgsOs,
@@ -1510,6 +1617,10 @@ fn parse_package_name(value: &OsString) -> Result<RequestedPackage, String> {
         }
         return Ok(RequestedPackage::HomebrewFormula(formula.to_string()));
     }
+    if let Some(npm_package) = package.strip_prefix("npm:") {
+        validate_npm_package_name(npm_package)?;
+        return Ok(RequestedPackage::NpmPackage(npm_package.to_string()));
+    }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
     }
@@ -1531,10 +1642,41 @@ fn parse_uninstall_package_name(value: &OsString) -> Result<String, String> {
         }
         return Ok(formula.to_string());
     }
+    if let Some(npm_package) = package.strip_prefix("npm:") {
+        validate_npm_package_name(npm_package)?;
+        return Ok(npm_package_install_name(npm_package));
+    }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
     }
     Ok(package.to_string())
+}
+
+fn validate_npm_package_name(package: &str) -> Result<(), String> {
+    if package.is_empty() {
+        return Err("package qualifier 'npm:' is missing a package name".to_string());
+    }
+    if let Some(scoped) = package.strip_prefix('@') {
+        let Some((scope, name)) = scoped.split_once('/') else {
+            return Err("scoped npm package names must be in the form @scope/name".to_string());
+        };
+        if scope.is_empty() || name.is_empty() || name.contains('/') {
+            return Err("scoped npm package names must be in the form @scope/name".to_string());
+        }
+        return Ok(());
+    }
+    if package.contains('/') {
+        return Err("npm package names must not contain path separators".to_string());
+    }
+    Ok(())
+}
+
+fn npm_package_install_name(package: &str) -> String {
+    package.rsplit('/').next().unwrap_or(package).to_string()
+}
+
+fn npm_package_executable_name(package: &str) -> String {
+    npm_package_install_name(package)
 }
 
 fn resolve_i_root_formula(package: &str) -> Result<String, String> {
@@ -1725,6 +1867,7 @@ fn resolve_package_status(config: &Config, package_name: &str) -> Result<Package
             resolve_formula_latest_version(config, root_formula)?
         }
         PackageReceiptSource::Vendor { vendor_name } => resolve_vendor_latest_version(vendor_name)?,
+        PackageReceiptSource::Npm { package_name } => resolve_npm_latest_version(package_name)?,
     };
 
     Ok(PackageStatus {
@@ -1740,6 +1883,7 @@ fn requested_package_name(package: &RequestedPackage) -> String {
         RequestedPackage::Auto(package_name) | RequestedPackage::HomebrewFormula(package_name) => {
             package_name.clone()
         }
+        RequestedPackage::NpmPackage(package_name) => npm_package_install_name(package_name),
     }
 }
 
@@ -1747,6 +1891,9 @@ fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
     match &status.source {
         PackageReceiptSource::Formula { root_formula } if status.package_name == *root_formula => {
             RequestedPackage::HomebrewFormula(root_formula.clone())
+        }
+        PackageReceiptSource::Npm { package_name } => {
+            RequestedPackage::NpmPackage(package_name.clone())
         }
         _ => RequestedPackage::Auto(status.package_name.clone()),
     }
@@ -1953,6 +2100,15 @@ fn resolve_vendor_latest_version(package_name: &str) -> Result<String, String> {
     (package.version)().map(|version| version.to_string())
 }
 
+fn resolve_npm_package_version(package_name: &str) -> Result<semver::Version, String> {
+    let version = vendor::npm_latest_tag(package_name)?;
+    vendor::parse_semver(&version, package_name)
+}
+
+fn resolve_npm_latest_version(package_name: &str) -> Result<String, String> {
+    resolve_npm_package_version(package_name).map(|version| version.to_string())
+}
+
 #[cfg(test)]
 fn extract_semver_from_text(text: &str) -> Option<semver::Version> {
     for token in text.split_whitespace() {
@@ -2057,16 +2213,38 @@ fn vendor_root_is_current(
             return Ok(false);
         }
     }
-    for executable in install.package.executables {
-        let found = ["bin", "sbin"]
-            .into_iter()
-            .map(|dir| plan.install_root.join(dir).join(executable))
-            .any(|candidate| is_executable(&candidate));
-        if !found {
-            return Ok(false);
-        }
+    Ok(declared_root_executables_exist(
+        &plan.install_root,
+        install.package.executables.iter().copied(),
+    ))
+}
+
+fn npm_root_is_current(
+    plan: &InstallPlan,
+    executable: &str,
+    version: &semver::Version,
+    installs: &[InstalledFormula],
+    bottle_tag: &str,
+) -> Result<bool, String> {
+    if !plan.install_root.is_dir() {
+        return Ok(false);
     }
-    Ok(true)
+    if !installs.is_empty() && !package_is_current(plan, installs, bottle_tag)? {
+        return Ok(false);
+    }
+    let Some(receipt) = load_package_receipt(&plan.root_receipt_path())? else {
+        return Ok(false);
+    };
+    if receipt.package_name != plan.package_name
+        || receipt.version != version.to_string()
+        || !matches!(receipt.source, PackageReceiptSource::Npm { .. })
+    {
+        return Ok(false);
+    }
+    Ok(declared_root_executables_exist(
+        &plan.install_root,
+        [executable],
+    ))
 }
 
 fn install_vendor_dependencies(
@@ -2169,17 +2347,10 @@ fn vendor_dependency_is_current(
         return Ok(false);
     }
 
-    for executable in install.package.executables {
-        let found = ["bin", "sbin"]
-            .into_iter()
-            .map(|dir| plan.install_root.join(dir).join(executable))
-            .any(|candidate| is_executable(&candidate));
-        if !found {
-            return Ok(false);
-        }
-    }
-
-    Ok(true)
+    Ok(declared_root_executables_exist(
+        &plan.install_root,
+        install.package.executables.iter().copied(),
+    ))
 }
 
 fn install_vendor_root(
@@ -2190,9 +2361,14 @@ fn install_vendor_root(
 ) -> Result<(), String> {
     let strategy = (vendor_install.package.install)(&vendor_install.version);
     match strategy {
-        vendor::InstallStrategy::NpmGlobal { package } => {
-            install_vendor_npm_global(plan, graph, vendor_install, &package, progress)
-        }
+        vendor::InstallStrategy::NpmGlobal { package } => install_npm_global(
+            plan,
+            graph,
+            vendor_install.package.name,
+            &package,
+            &vendor_install.version,
+            progress,
+        ),
         vendor::InstallStrategy::CopyFile {
             source,
             destination_dir,
@@ -2216,34 +2392,39 @@ fn install_vendor_root(
     }
 }
 
-fn install_vendor_npm_global(
+fn install_npm_root(
     plan: &InstallPlan,
     graph: &[FormulaSpec],
-    vendor_install: &VendorInstall,
+    display_name: &str,
+    npm_package: &str,
+    version: &semver::Version,
+    progress: Option<&InstallProgress>,
+) -> Result<(), String> {
+    install_npm_global(plan, graph, display_name, npm_package, version, progress)
+}
+
+fn install_npm_global(
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+    display_name: &str,
     package: &str,
+    version: &semver::Version,
     progress: Option<&InstallProgress>,
 ) -> Result<(), String> {
     if let Some(progress) = progress {
         progress.begin_install_phase();
         progress.log("running npm install");
     }
-    let npm = resolve_install_time_command(plan, graph, "npm").ok_or_else(|| {
-        format!(
-            "vendor package {} requires npm in PATH",
-            vendor_install.package.name
-        )
-    })?;
+    let npm = resolve_install_time_command(plan, graph, "npm")
+        .ok_or_else(|| format!("package {display_name} requires npm in PATH"))?;
     let npm_env = TempDir::new_in(&plan.tmp_root).map_err(|err| {
-        format!(
-            "failed to create temp dir for npm install of {}: {err}",
-            vendor_install.package.name
-        )
+        format!("failed to create temp dir for npm install of {display_name}: {err}")
     })?;
     let mut command = build_sandboxed_npm_install_command(
         SANDBOX_EXEC,
         &npm,
         package,
-        &vendor_install.version,
+        version,
         &plan.install_root,
         &plan.tmp_root,
         &npm_env,
@@ -2252,7 +2433,7 @@ fn install_vendor_npm_global(
     let output = run_command_with_logged_output(
         &mut command,
         progress,
-        &format!("failed to run npm for {}", vendor_install.package.name),
+        &format!("failed to run npm for {display_name}"),
     )?;
     if output.status.success() {
         return Ok(());
@@ -2260,13 +2441,11 @@ fn install_vendor_npm_global(
 
     Err(match output.status.code() {
         Some(code) => format!(
-            "npm install failed for {} with exit code {code}{}",
-            vendor_install.package.name,
+            "npm install failed for {display_name} with exit code {code}{}",
             format_command_output_suffix(&output.lines)
         ),
         None => format!(
-            "npm install terminated by signal for {}{}",
-            vendor_install.package.name,
+            "npm install terminated by signal for {display_name}{}",
             format_command_output_suffix(&output.lines)
         ),
     })
@@ -2733,12 +2912,10 @@ fn sync_stubs(
         if manifest.stubs.is_empty() {
             collect_root_executables(&plan.install_root)?
         } else {
-            let names = manifest
-                .stubs
-                .iter()
-                .map(|value| value.as_str())
-                .collect::<Vec<_>>();
-            collect_declared_root_executables(&plan.install_root, &names)?
+            collect_declared_root_executables(
+                &plan.install_root,
+                manifest.stubs.iter().map(String::as_str),
+            )?
         }
     } else {
         collect_root_executables(&plan.stable_root)?
@@ -2772,13 +2949,31 @@ fn sync_vendor_stubs(
     package: &vendor::VendorPackage,
     previous_stubs: &[String],
 ) -> Result<(), String> {
+    sync_declared_stubs(
+        plan,
+        graph,
+        package.executables.iter().copied(),
+        previous_stubs,
+    )
+}
+
+fn sync_declared_stubs<I, S>(
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+    executables: I,
+    previous_stubs: &[String],
+) -> Result<(), String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
     if plan.mode != Mode::I {
         return Ok(());
     }
 
     fs::create_dir_all(USR_LOCAL_BIN)
         .map_err(|err| format!("failed to create {}: {err}", USR_LOCAL_BIN))?;
-    let current = collect_declared_root_executables(&plan.install_root, package.executables)?;
+    let current = collect_declared_root_executables(&plan.install_root, executables)?;
     for stub in previous_stubs {
         if !current.iter().any(|(name, _)| name == stub) {
             let path = PathBuf::from(USR_LOCAL_BIN).join(&stub);
@@ -2865,19 +3060,33 @@ fn collect_root_executables(root: &Path) -> Result<Vec<(String, PathBuf)>, Strin
 
 fn collect_declared_root_executables(
     root: &Path,
-    executables: &[&str],
+    executables: impl IntoIterator<Item = impl AsRef<str>>,
 ) -> Result<Vec<(String, PathBuf)>, String> {
-    let mut execs = Vec::with_capacity(executables.len());
+    let mut execs = Vec::new();
     for executable in executables {
+        let executable = executable.as_ref();
         let path = ["bin", "sbin"]
             .into_iter()
             .map(|dir| root.join(dir).join(executable))
             .find(|candidate| is_executable(candidate))
             .ok_or_else(|| format!("expected executable {executable} under {}", root.display()))?;
-        execs.push(((*executable).to_string(), path));
+        execs.push((executable.to_string(), path));
     }
     execs.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(execs)
+}
+
+fn declared_root_executables_exist(
+    root: &Path,
+    executables: impl IntoIterator<Item = impl AsRef<str>>,
+) -> bool {
+    executables.into_iter().all(|executable| {
+        let executable = executable.as_ref();
+        ["bin", "sbin"]
+            .into_iter()
+            .map(|dir| root.join(dir).join(executable))
+            .any(|candidate| is_executable(&candidate))
+    })
 }
 
 fn load_stub_manifest(path: &Path) -> Result<StubManifest, String> {
@@ -2995,31 +3204,31 @@ fn print_x_usage(program: &str) {
 }
 
 fn print_i_usage(program: &str) {
-    println!("Usage: {program} [-f | --force] <package|brew.sh/formula>...");
+    println!("Usage: {program} [-f | --force] <package|brew.sh/formula|npm:package>...");
     println!();
     println!("Installs self-contained packages under {OPT_PKG_ROOT}.");
 }
 
 fn print_uninstall_usage(program: &str) {
-    println!("Usage: {program} <package|brew.sh/formula>...");
+    println!("Usage: {program} <package|brew.sh/formula|npm:package>...");
     println!();
     println!("Removes installed packages from {OPT_PKG_ROOT}.");
 }
 
 fn print_outdated_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula]...");
+    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
     println!();
     println!("Lists installed packages with newer versions available.");
 }
 
 fn print_update_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula]...");
+    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
     println!();
     println!("Reinstalls installed packages with newer versions available.");
 }
 
 fn print_list_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula]...");
+    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
     println!();
     println!("Lists installed packages with their versions.");
 }
@@ -4924,9 +5133,7 @@ fn is_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vendor::{
-        bun, clawhub, codex, deno, get, gh, github_release_url, node, openclaw, parse_semver, qmd,
-    };
+    use crate::vendor::{bun, codex, deno, get, gh, github_release_url, node, parse_semver, qmd};
     use semver::Version;
 
     fn test_db(entries: &[(&str, &str)]) -> Db {
@@ -5210,6 +5417,43 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_i_request_accepts_qualified_npm_package_names() {
+        let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
+        let request = parse_i_request_from_iter(
+            &invocation,
+            vec![
+                OsString::from("npm:openclaw"),
+                OsString::from("npm:@tobilu/qmd"),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(IRequest {
+                packages: vec![
+                    RequestedPackage::NpmPackage("openclaw".to_string()),
+                    RequestedPackage::NpmPackage("@tobilu/qmd".to_string()),
+                ],
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_i_request_rejects_invalid_npm_package_name() {
+        let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
+        let request =
+            parse_i_request_from_iter(&invocation, vec![OsString::from("npm:foo/bar")].into_iter());
+
+        assert_eq!(
+            request,
+            Err("npm package names must not contain path separators".to_string())
+        );
+    }
+
+    #[test]
     fn parse_i_request_rejects_empty_qualified_homebrew_formula_name() {
         let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
         let request =
@@ -5252,6 +5496,27 @@ package or `bar` for the package that provides the `foo` executable"
             request,
             Some(UninstallRequest {
                 packages: vec!["python@3.12".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_uninstall_request_accepts_qualified_npm_package_names() {
+        let invocation = Invocation {
+            binary_name: "p0r".to_string(),
+            name: "p0r rm".to_string(),
+            mode: None,
+        };
+        let request = parse_uninstall_request_from_iter(
+            &invocation,
+            vec![OsString::from("npm:@tobilu/qmd")].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UninstallRequest {
+                packages: vec!["qmd".to_string()],
             })
         );
     }
@@ -5307,6 +5572,7 @@ package or `bar` for the package that provides the `foo` executable"
                 OsString::from("ffmpeg"),
                 OsString::from(SELF_UPDATE_DISABLE_FLAG),
                 OsString::from("brew.sh/python@3.12"),
+                OsString::from("npm:openclaw"),
             ]
             .into_iter(),
         )
@@ -5318,6 +5584,7 @@ package or `bar` for the package that provides the `foo` executable"
                 selection: PackageSelection::Requested(vec![
                     RequestedPackage::Auto("ffmpeg".to_string()),
                     RequestedPackage::HomebrewFormula("python@3.12".to_string()),
+                    RequestedPackage::NpmPackage("openclaw".to_string()),
                 ]),
                 no_self_update: true,
             })
@@ -5514,6 +5781,14 @@ package or `bar` for the package that provides the `foo` executable"
             installed_version: "2.7.7".to_string(),
             latest_version: "2.7.8".to_string(),
         };
+        let npm = PackageStatus {
+            package_name: "openclaw".to_string(),
+            source: PackageReceiptSource::Npm {
+                package_name: "openclaw".to_string(),
+            },
+            installed_version: "1.2.3".to_string(),
+            latest_version: "1.2.4".to_string(),
+        };
 
         assert_eq!(
             requested_package_from_status(&formula),
@@ -5526,6 +5801,10 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             requested_package_from_status(&vendor),
             RequestedPackage::Auto("deno".to_string())
+        );
+        assert_eq!(
+            requested_package_from_status(&npm),
+            RequestedPackage::NpmPackage("openclaw".to_string())
         );
     }
 
@@ -6180,10 +6459,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
     #[test]
     fn partition_dependency_names_recurses_through_vendor_dependencies() {
-        let (formulas, vendors) = partition_dependency_names(&["openclaw"]).unwrap();
+        let (formulas, vendors) = partition_dependency_names(&["qmd"]).unwrap();
 
-        assert!(formulas.is_empty());
-        assert_eq!(vendors, vec!["node".to_string(), "openclaw".to_string()]);
+        assert_eq!(formulas, vec!["sqlite".to_string()]);
+        assert_eq!(vendors, vec!["node".to_string(), "qmd".to_string()]);
     }
 
     #[test]
@@ -6191,8 +6470,8 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         let temp = TempDir::new().unwrap();
         let plan = InstallPlan {
             mode: Mode::I,
-            package_name: "openclaw".to_string(),
-            root_formula: "openclaw".to_string(),
+            package_name: "npm-openclaw".to_string(),
+            root_formula: "npm-openclaw".to_string(),
             stable_root: temp.path().join("stable"),
             install_root: temp.path().join("install"),
             tmp_root: temp.path().join("tmp"),
@@ -7449,10 +7728,10 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
         let temp = TempDir::new().unwrap();
         let plan = InstallPlan {
             mode: Mode::I,
-            package_name: "clawhub".to_string(),
-            root_formula: "clawhub".to_string(),
-            stable_root: temp.path().join("opt/clawhub"),
-            install_root: temp.path().join("opt/clawhub"),
+            package_name: "npm-openclaw".to_string(),
+            root_formula: "npm-openclaw".to_string(),
+            stable_root: temp.path().join("opt/npm-openclaw"),
+            install_root: temp.path().join("opt/npm-openclaw"),
             tmp_root: temp.path().join("tmp"),
         };
         fs::create_dir_all(&plan.install_root).unwrap();
@@ -7650,14 +7929,6 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
             _ => panic!("node should install a tree"),
         }
 
-        match clawhub::install(&Version::parse("1.2.3").unwrap()) {
-            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "clawhub"),
-            _ => panic!("clawhub should install with npm"),
-        }
-        match openclaw::install(&Version::parse("1.2.3").unwrap()) {
-            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "openclaw"),
-            _ => panic!("openclaw should install with npm"),
-        }
         match qmd::install(&Version::parse("1.2.3").unwrap()) {
             vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "@tobilu/qmd"),
             _ => panic!("qmd should install with npm"),
@@ -7770,7 +8041,7 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
     }
 
     #[test]
-    fn vendor_version_fetchers_use_fixture_metadata_servers() {
+    fn vendor_and_npm_version_fetchers_use_fixture_metadata_servers() {
         let _env_lock = test_env_lock().lock().unwrap();
         let (base, server) = start_test_http_server(
             vec![
@@ -7799,15 +8070,11 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
                     br#"{"tag_name":"v0.1.0"}"#.to_vec(),
                 ),
                 (
-                    "/clawhub".to_string(),
-                    br#"{"dist-tags":{"latest":"1.2.3"}}"#.to_vec(),
-                ),
-                (
                     "/openclaw".to_string(),
                     br#"{"dist-tags":{"latest":"4.5.6"}}"#.to_vec(),
                 ),
             ],
-            8,
+            7,
         );
         let _env = TestEnvGuard::set(&[
             ("PKG_GITHUB_API_ROOT", &base),
@@ -7824,12 +8091,8 @@ info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead
         assert_eq!(node::version().unwrap(), Version::parse("22.18.0").unwrap());
         assert_eq!(qmd::version().unwrap(), Version::parse("0.1.0").unwrap());
         assert_eq!(
-            clawhub::version().unwrap(),
-            Version::parse("1.2.3").unwrap()
-        );
-        assert_eq!(
-            openclaw::version().unwrap(),
-            Version::parse("4.5.6").unwrap()
+            resolve_npm_latest_version("openclaw").unwrap(),
+            "4.5.6".to_string()
         );
         server.join().unwrap();
     }
