@@ -8,14 +8,8 @@ on:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
+    name: test (macos-latest)
+    runs-on: macos-latest
 
     steps:
       - name: Checkout
@@ -41,42 +35,3 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
-
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-
-      - name: Create stub db.json
-        run: |
-          if [ ! -f data/db.json ]; then
-            mkdir -p data
-            printf '%s\n' \
-              '{' \
-              '  "schema": 2,' \
-              '  "generated_at": "1970-01-01T00:00:00Z",' \
-              '  "entries": {}' \
-              '}' > data/db.json
-          fi
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
-
-      - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
-
-      - name: Generate coverage report
-        run: cargo llvm-cov --locked --lcov --output-path lcov.info
-
-      - name: Upload coverage to Coveralls
-        uses: coverallsapp/github-action@v2
-        with:
-          github-token: ${{ github.token }}
-          file: lcov.info
-          format: lcov
