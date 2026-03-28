@@ -1,0 +1,6 @@
+{
+  "psycopg2": {
+    "pythonFormula": "python@3.12",
+    "homebrewDeps": ["libpq"]
+  }
+}

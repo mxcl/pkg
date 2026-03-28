@@ -70,11 +70,13 @@ mod post_install_hooks {
 const DB_SCHEMA_VERSION: u32 = 2;
 const EMBEDDED_DB: &[u8] = include_bytes!("../data/db.json");
 const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.js");
+const EMBEDDED_PIP_DATA: &str = include_str!("../data/pip.json");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
     include_str!("../data/post_install_check_skip.jsonc");
 const BREW_PACKAGE_PREFIX: &str = "brew:";
 const FORMULA_API_ROOT: &str = "https://formulae.brew.sh/api/formula";
 const FORMULA_API_INDEX_URL: &str = "https://formulae.brew.sh/api/formula.json";
+const PYPI_ROOT: &str = "https://pypi.org/pypi";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const RELOCATABLE_HOMEBREW_PREFIX: &str = "/opt/homebrew";
 const HOMEBREW_PREFIX_PLACEHOLDER: &str = "@@HOMEBREW_PREFIX@@";
@@ -101,6 +103,7 @@ const TMP_X_ROOT: &str = "/tmp/x";
 const TMP_TOOL_ROOT: &str = "/tmp/pkgtool";
 const OPT_PKG_ROOT: &str = "/opt";
 const OPT_NPM_ROOT: &str = "/opt/npm";
+const OPT_PIP_ROOT: &str = "/opt/pip";
 const PKG_STATE_LOCK: &str = ".pkg.lock";
 const USR_LOCAL_BIN: &str = "/usr/local/bin";
 #[cfg(feature = "gold-release")]
@@ -120,7 +123,8 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const SAFE_BINARY_PATH_BYTES: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-/@";
 static POST_INSTALL_CHECK_SKIP: OnceLock<HashSet<String>> = OnceLock::new();
-static NPM_PACKAGE_DATA: OnceLock<HashMap<String, NpmPackageData>> = OnceLock::new();
+static NPM_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
+static PIP_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
 static FORMULA_ALIAS_INDEX: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
 
 fn formula_api_root() -> String {
@@ -129,6 +133,10 @@ fn formula_api_root() -> String {
 
 fn formula_api_index_url() -> String {
     env::var("PKG_FORMULA_API_INDEX_URL").unwrap_or_else(|_| FORMULA_API_INDEX_URL.to_string())
+}
+
+fn pypi_root() -> String {
+    env::var("PKG_PYPI_ROOT").unwrap_or_else(|_| PYPI_ROOT.to_string())
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,9 +148,11 @@ struct Db {
 }
 
 #[derive(Debug, Deserialize, Default)]
-struct NpmPackageData {
+struct PackageInstallData {
     #[serde(default, rename = "homebrewDeps")]
     homebrew_dependencies: Vec<String>,
+    #[serde(default, rename = "pythonFormula")]
+    python_formula: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,6 +167,16 @@ struct FormulaInfo {
     disabled: bool,
     #[serde(default)]
     post_install_defined: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PypiPackageInfoResponse {
+    info: PypiPackageInfo,
+}
+
+#[derive(Debug, Deserialize)]
+struct PypiPackageInfo {
+    version: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -273,6 +293,7 @@ enum RequestedPackage {
     Auto(String),
     HomebrewFormula(String),
     NpmPackage(String),
+    PipPackage(String),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -334,6 +355,7 @@ enum PackageReceiptSource {
     Formula { root_formula: String },
     Vendor { vendor_name: String },
     Npm { package_name: String },
+    Pip { package_name: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +523,24 @@ impl InstallPlan {
             install_root,
             tmp_root: temp_root_for_target_root(
                 &npm_root,
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            ),
+        }
+    }
+
+    fn for_i_pip(package_name: String, root_formula: String, pip_package: &str) -> Self {
+        let pip_root = PathBuf::from(OPT_PIP_ROOT);
+        let stable_root = pip_root.join(pip_package_install_leaf_name(pip_package));
+        let install_root = stable_root.clone();
+        Self {
+            mode: Mode::I,
+            package_name,
+            root_formula,
+            stable_root,
+            install_root,
+            tmp_root: temp_root_for_target_root(
+                &pip_root,
                 Path::new(SYSTEM_TMP_ROOT),
                 Path::new(TMP_TOOL_ROOT),
             ),
@@ -921,6 +961,7 @@ fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> R
             run_i_formula(config, formula.clone(), formula)
         }
         RequestedPackage::NpmPackage(npm_package) => run_i_npm(config, package_name, npm_package),
+        RequestedPackage::PipPackage(pip_package) => run_i_pip(config, package_name, pip_package),
     }
 }
 
@@ -1384,6 +1425,89 @@ fn run_i_npm(config: &Config, package_name: String, npm_package: String) -> Resu
     }
 }
 
+fn run_i_pip(config: &Config, package_name: String, pip_package: String) -> Result<(), String> {
+    let progress = InstallProgress::new(&package_name);
+    let result = (|| {
+        let plan = InstallPlan::for_i_pip(package_name.clone(), package_name.clone(), &pip_package);
+        let previous_stubs = load_stub_manifest(&plan.package_manifest_path())?.stubs;
+        let version = resolve_pip_latest_version(&pip_package)?;
+        let mut dependency_names = vec![pip_package_python_formula(&pip_package)];
+        append_pip_package_homebrew_dependencies(&mut dependency_names, &pip_package);
+        let formula_graph = resolve_formula_specs(&dependency_names, config, true)?;
+        let dependency_state =
+            resolve_dependency_install_state(&formula_graph, &plan.tmp_root, Some(&progress))?;
+        ensure_plan_parent_dirs(&plan)?;
+
+        let dependency_current =
+            dependencies_are_current(&plan, &dependency_state.installs, &[], config)?;
+        let mut dependencies_reinstalled = false;
+        if !dependency_current {
+            progress.begin_install_phase();
+            install_dependency_formulas(
+                config,
+                &plan,
+                &dependency_state.installs,
+                Some(&progress),
+            )?;
+            dependencies_reinstalled = true;
+        }
+
+        if !pip_root_is_current(
+            &plan,
+            &version,
+            &dependency_state.installs,
+            &config.bottle_tag,
+        )? {
+            if !dependencies_reinstalled {
+                reinstall_vendor_dependency_tree(
+                    config,
+                    &plan,
+                    &dependency_state.installs,
+                    &[],
+                    &[],
+                    Some(&progress),
+                )?;
+            }
+            let entrypoints = install_pip_root(
+                &plan,
+                &formula_graph,
+                &package_name,
+                &pip_package,
+                &version,
+                Some(&progress),
+            )?;
+            write_root_executable_manifest(&plan.root_executables_manifest_path(), &entrypoints)?;
+        }
+
+        activate_install(&plan)?;
+        write_package_receipt(
+            &plan.root_receipt_path(),
+            &PackageReceipt {
+                package_name: package_name.clone(),
+                version: version.to_string(),
+                source: PackageReceiptSource::Pip {
+                    package_name: pip_package.clone(),
+                },
+            },
+        )?;
+        let root_executables =
+            load_root_executable_manifest(&plan.root_executables_manifest_path())?.stubs;
+        sync_declared_stubs(&plan, &formula_graph, &root_executables, &previous_stubs)?;
+        installed_stub_paths(&plan)
+    })();
+
+    match result {
+        Ok(paths) => {
+            progress.finish_with_paths(&paths);
+            Ok(())
+        }
+        Err(err) => {
+            progress.clear();
+            Err(err)
+        }
+    }
+}
+
 fn parse_x_request(
     invocation: &Invocation,
     args: &mut env::ArgsOs,
@@ -1674,6 +1798,12 @@ fn parse_package_name(value: &OsString) -> Result<RequestedPackage, String> {
         validate_npm_package_name(npm_package)?;
         return Ok(RequestedPackage::NpmPackage(npm_package.to_string()));
     }
+    if let Some(pip_package) = package.strip_prefix("pip:") {
+        validate_pip_package_name(pip_package)?;
+        return Ok(RequestedPackage::PipPackage(normalize_pip_package_name(
+            pip_package,
+        )));
+    }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
     }
@@ -1700,6 +1830,12 @@ fn parse_uninstall_package_name(value: &OsString) -> Result<String, String> {
     if let Some(npm_package) = package.strip_prefix("npm:") {
         validate_npm_package_name(npm_package)?;
         return Ok(npm_package_display_name(npm_package));
+    }
+    if let Some(pip_package) = package.strip_prefix("pip:") {
+        validate_pip_package_name(pip_package)?;
+        return Ok(pip_package_display_name(&normalize_pip_package_name(
+            pip_package,
+        )));
     }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
@@ -1738,12 +1874,61 @@ fn npm_package_executable_name(package: &str) -> String {
     npm_package_install_leaf_name(package)
 }
 
+fn validate_pip_package_name(package: &str) -> Result<(), String> {
+    if package.is_empty() {
+        return Err("package qualifier 'pip:' is missing a package name".to_string());
+    }
+    if package.contains('/') {
+        return Err("pip package names must not contain path separators".to_string());
+    }
+    if !package
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(
+            "pip package names may only contain ASCII letters, numbers, '.', '-' and '_'"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn normalize_pip_package_name(package: &str) -> String {
+    let mut normalized = String::with_capacity(package.len());
+    let mut saw_separator = false;
+    for ch in package.chars() {
+        let lower = ch.to_ascii_lowercase();
+        if lower.is_ascii_alphanumeric() {
+            normalized.push(lower);
+            saw_separator = false;
+        } else if matches!(lower, '-' | '_' | '.') && !saw_separator {
+            normalized.push('-');
+            saw_separator = true;
+        }
+    }
+    normalized.trim_matches('-').to_string()
+}
+
+fn pip_package_display_name(package: &str) -> String {
+    format!("pip:{package}")
+}
+
+fn pip_package_install_leaf_name(package: &str) -> String {
+    normalize_pip_package_name(package)
+}
+
 fn package_install_root(opt_root: &Path, package_name: &str) -> Result<PathBuf, String> {
     if let Some(npm_package) = package_name.strip_prefix("npm:") {
         validate_npm_package_name(npm_package)?;
         return Ok(opt_root
             .join("npm")
             .join(npm_package_install_leaf_name(npm_package)));
+    }
+    if let Some(pip_package) = package_name.strip_prefix("pip:") {
+        validate_pip_package_name(pip_package)?;
+        return Ok(opt_root
+            .join("pip")
+            .join(pip_package_install_leaf_name(pip_package)));
     }
     Ok(opt_root.join(package_name))
 }
@@ -1828,7 +2013,7 @@ fn embedded_post_install_check_skip() -> &'static HashSet<String> {
     })
 }
 
-fn embedded_npm_package_data() -> &'static HashMap<String, NpmPackageData> {
+fn embedded_npm_package_data() -> &'static HashMap<String, PackageInstallData> {
     NPM_PACKAGE_DATA.get_or_init(|| {
         json5::from_str(EMBEDDED_NPM_DATA).expect("failed to parse embedded npm package data")
     })
@@ -1851,6 +2036,34 @@ fn append_npm_package_homebrew_dependencies(formula_names: &mut Vec<String>, pac
     for dependency in npm_package_homebrew_dependencies(package) {
         push_unique_string(formula_names, dependency);
     }
+}
+
+fn embedded_pip_package_data() -> &'static HashMap<String, PackageInstallData> {
+    PIP_PACKAGE_DATA.get_or_init(|| {
+        serde_json::from_str(EMBEDDED_PIP_DATA).expect("failed to parse embedded pip package data")
+    })
+}
+
+fn pip_package_install_data(package: &str) -> Option<&'static PackageInstallData> {
+    embedded_pip_package_data().get(&normalize_pip_package_name(package))
+}
+
+fn pip_package_homebrew_dependencies(package: &str) -> Vec<String> {
+    pip_package_install_data(package)
+        .map(|entry| entry.homebrew_dependencies.clone())
+        .unwrap_or_default()
+}
+
+fn append_pip_package_homebrew_dependencies(formula_names: &mut Vec<String>, package: &str) {
+    for dependency in pip_package_homebrew_dependencies(package) {
+        push_unique_string(formula_names, dependency);
+    }
+}
+
+fn pip_package_python_formula(package: &str) -> String {
+    pip_package_install_data(package)
+        .and_then(|entry| entry.python_formula.clone())
+        .unwrap_or_else(|| "python".to_string())
 }
 
 fn append_vendor_npm_homebrew_dependencies(
@@ -1980,6 +2193,7 @@ fn resolve_package_status_at(
         }
         PackageReceiptSource::Vendor { vendor_name } => resolve_vendor_latest_version(vendor_name)?,
         PackageReceiptSource::Npm { package_name } => resolve_npm_latest_version(package_name)?,
+        PackageReceiptSource::Pip { package_name } => resolve_pip_latest_version(package_name)?,
     };
 
     Ok(PackageStatus {
@@ -1996,6 +2210,7 @@ fn requested_package_name(package: &RequestedPackage) -> String {
             package_name.clone()
         }
         RequestedPackage::NpmPackage(package_name) => npm_package_display_name(package_name),
+        RequestedPackage::PipPackage(package_name) => pip_package_display_name(package_name),
     }
 }
 
@@ -2006,6 +2221,9 @@ fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
         }
         PackageReceiptSource::Npm { package_name } => {
             RequestedPackage::NpmPackage(package_name.clone())
+        }
+        PackageReceiptSource::Pip { package_name } => {
+            RequestedPackage::PipPackage(package_name.clone())
         }
         _ => RequestedPackage::Auto(status.package_name.clone()),
     }
@@ -2180,6 +2398,10 @@ fn installed_package_refs(opt_root: &Path) -> Result<Vec<InstalledPackageRef>, S
             packages.extend(installed_npm_package_refs(&path)?);
             continue;
         }
+        if name == "pip" {
+            packages.extend(installed_pip_package_refs(&path)?);
+            continue;
+        }
         packages.push(InstalledPackageRef {
             package_name: name,
             install_root: path,
@@ -2210,6 +2432,35 @@ fn installed_npm_package_refs(npm_root: &Path) -> Result<Vec<InstalledPackageRef
             package_name: match load_package_receipt(&path.join(ROOT_RECEIPT)) {
                 Ok(Some(receipt)) => receipt.package_name,
                 Ok(None) | Err(_) => npm_package_display_name(&name),
+            },
+            install_root: path,
+        });
+    }
+    Ok(packages)
+}
+
+fn installed_pip_package_refs(pip_root: &Path) -> Result<Vec<InstalledPackageRef>, String> {
+    let entries = match fs::read_dir(pip_root) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(format!("failed to read {}: {err}", pip_root.display())),
+    };
+
+    let mut packages = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("failed to read {}: {err}", pip_root.display()))?;
+        let path = entry.path();
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| format!("non-utf8 directory name under {}", pip_root.display()))?;
+        if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        packages.push(InstalledPackageRef {
+            package_name: match load_package_receipt(&path.join(ROOT_RECEIPT)) {
+                Ok(Some(receipt)) => receipt.package_name,
+                Ok(None) | Err(_) => pip_package_display_name(&name),
             },
             install_root: path,
         });
@@ -2265,6 +2516,20 @@ fn resolve_npm_package_version(package_name: &str) -> Result<semver::Version, St
 
 fn resolve_npm_latest_version(package_name: &str) -> Result<String, String> {
     resolve_npm_package_version(package_name).map(|version| version.to_string())
+}
+
+fn resolve_pip_latest_version(package_name: &str) -> Result<String, String> {
+    let normalized = normalize_pip_package_name(package_name);
+    let url = format!("{}/{}/json", pypi_root(), urlencoding::encode(&normalized));
+    let response: PypiPackageInfoResponse = fetch_json(&url, || {
+        format!("failed to fetch PyPI metadata for {package_name}")
+    })?;
+    if response.info.version.is_empty() {
+        return Err(format!(
+            "failed to resolve latest PyPI version for {package_name}"
+        ));
+    }
+    Ok(response.info.version)
 }
 
 #[cfg(test)]
@@ -2402,6 +2667,37 @@ fn npm_root_is_current(
     Ok(declared_root_executables_exist(
         &plan.install_root,
         [executable],
+    ))
+}
+
+fn pip_root_is_current(
+    plan: &InstallPlan,
+    version: &str,
+    installs: &[InstalledFormula],
+    bottle_tag: &str,
+) -> Result<bool, String> {
+    if !plan.install_root.is_dir() {
+        return Ok(false);
+    }
+    if !installs.is_empty() && !package_is_current(plan, installs, bottle_tag)? {
+        return Ok(false);
+    }
+    let Some(receipt) = load_package_receipt(&plan.root_receipt_path())? else {
+        return Ok(false);
+    };
+    if receipt.package_name != plan.package_name
+        || receipt.version != version
+        || !matches!(receipt.source, PackageReceiptSource::Pip { .. })
+    {
+        return Ok(false);
+    }
+    if !plan.install_root.join("venv").join("pyvenv.cfg").is_file() {
+        return Ok(false);
+    }
+    let manifest = load_root_executable_manifest(&plan.root_executables_manifest_path())?;
+    Ok(declared_root_executables_exist(
+        &plan.install_root,
+        manifest.stubs.iter().map(String::as_str),
     ))
 }
 
@@ -2561,6 +2857,75 @@ fn install_npm_root(
     install_npm_global(plan, graph, display_name, npm_package, version, progress)
 }
 
+fn install_pip_root(
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+    display_name: &str,
+    package: &str,
+    version: &str,
+    progress: Option<&InstallProgress>,
+) -> Result<Vec<String>, String> {
+    if let Some(progress) = progress {
+        progress.begin_install_phase();
+        progress.log("creating virtualenv");
+    }
+    let python = resolve_install_time_command(plan, graph, "python3")
+        .or_else(|| resolve_install_time_command(plan, graph, "python"))
+        .ok_or_else(|| format!("package {display_name} requires python in PATH"))?;
+    let env_root = TempDir::new_in(&plan.tmp_root).map_err(|err| {
+        format!("failed to create temp dir for pip install of {display_name}: {err}")
+    })?;
+    let venv_root = plan.install_root.join("venv");
+
+    let mut venv_command =
+        build_pip_venv_command(&python, &venv_root, env_root.path(), plan, graph)?;
+    let output = run_command_with_logged_output(
+        &mut venv_command,
+        progress,
+        &format!("failed to create virtualenv for {display_name}"),
+    )?;
+    if !output.status.success() {
+        return Err(match output.status.code() {
+            Some(code) => format!(
+                "virtualenv creation failed for {display_name} with exit code {code}{}",
+                format_command_output_suffix(&output.lines)
+            ),
+            None => format!(
+                "virtualenv creation terminated by signal for {display_name}{}",
+                format_command_output_suffix(&output.lines)
+            ),
+        });
+    }
+
+    if let Some(progress) = progress {
+        progress.log("running pip install");
+    }
+    let pip = venv_root.join("bin/pip");
+    let mut pip_command =
+        build_pip_install_command(&pip, package, version, env_root.path(), plan, graph)?;
+    let output = run_command_with_logged_output(
+        &mut pip_command,
+        progress,
+        &format!("failed to run pip for {display_name}"),
+    )?;
+    if !output.status.success() {
+        return Err(match output.status.code() {
+            Some(code) => format!(
+                "pip install failed for {display_name} with exit code {code}{}",
+                format_command_output_suffix(&output.lines)
+            ),
+            None => format!(
+                "pip install terminated by signal for {display_name}{}",
+                format_command_output_suffix(&output.lines)
+            ),
+        });
+    }
+
+    let entrypoints = discover_pip_entrypoints(&venv_root, package)?;
+    write_pip_entrypoint_stubs(plan, &venv_root, &entrypoints)?;
+    Ok(entrypoints)
+}
+
 fn install_npm_global(
     plan: &InstallPlan,
     graph: &[FormulaSpec],
@@ -2607,6 +2972,139 @@ fn install_npm_global(
             format_command_output_suffix(&output.lines)
         ),
     })
+}
+
+fn pip_env_paths(sandbox_root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    (
+        sandbox_root.join("home"),
+        sandbox_root.join("xdg-cache"),
+        sandbox_root.join("pip-cache"),
+    )
+}
+
+fn prepare_pip_env(sandbox_root: &Path) -> Result<(), String> {
+    let (home, xdg_cache_home, pip_cache_dir) = pip_env_paths(sandbox_root);
+    for dir in [&home, &xdg_cache_home, &pip_cache_dir] {
+        fs::create_dir_all(dir)
+            .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
+    }
+    Ok(())
+}
+
+fn build_pip_venv_command(
+    python: impl AsRef<Path>,
+    venv_root: &Path,
+    sandbox_root: &Path,
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+) -> Result<Command, String> {
+    prepare_pip_env(sandbox_root)?;
+    let mut command = Command::new(python.as_ref());
+    command
+        .arg("-m")
+        .arg("venv")
+        .arg("--copies")
+        .arg(venv_root)
+        .current_dir(sandbox_root)
+        .env("PATH", build_install_path(plan, graph))
+        .env("TMPDIR", &plan.tmp_root)
+        .env("HOME", sandbox_root.join("home"))
+        .env("XDG_CACHE_HOME", sandbox_root.join("xdg-cache"))
+        .env("PIP_CACHE_DIR", sandbox_root.join("pip-cache"))
+        .env("PYTHONNOUSERSITE", "1");
+    Ok(command)
+}
+
+fn build_pip_install_command(
+    pip: &Path,
+    package: &str,
+    version: &str,
+    sandbox_root: &Path,
+    plan: &InstallPlan,
+    graph: &[FormulaSpec],
+) -> Result<Command, String> {
+    prepare_pip_env(sandbox_root)?;
+    let mut command = Command::new(pip);
+    command
+        .arg("install")
+        .arg("--disable-pip-version-check")
+        .arg("--no-input")
+        .arg(format!("{package}=={version}"))
+        .current_dir(sandbox_root)
+        .env("PATH", build_install_path(plan, graph))
+        .env("TMPDIR", &plan.tmp_root)
+        .env("HOME", sandbox_root.join("home"))
+        .env("XDG_CACHE_HOME", sandbox_root.join("xdg-cache"))
+        .env("PIP_CACHE_DIR", sandbox_root.join("pip-cache"))
+        .env("PYTHONNOUSERSITE", "1");
+    Ok(command)
+}
+
+fn discover_pip_entrypoints(venv_root: &Path, package: &str) -> Result<Vec<String>, String> {
+    let python = venv_root.join("bin/python");
+    let mut command = Command::new(&python);
+    command.arg("-c").arg(
+        "import importlib.metadata as md, json, sys\n\
+def norm(value):\n\
+    out = []\n\
+    last_sep = False\n\
+    for ch in value.lower():\n\
+        if ch.isalnum():\n\
+            out.append(ch)\n\
+            last_sep = False\n\
+        elif ch in '-_.':\n\
+            if not last_sep:\n\
+                out.append('-')\n\
+                last_sep = True\n\
+    return ''.join(out).strip('-')\n\
+want = norm(sys.argv[1])\n\
+for dist in md.distributions():\n\
+    name = dist.metadata.get('Name')\n\
+    if name and norm(name) == want:\n\
+        print(json.dumps(sorted({ep.name for ep in dist.entry_points if ep.group in {'console_scripts', 'gui_scripts'}})))\n\
+        raise SystemExit(0)\n\
+print('[]')\n",
+    );
+    command.arg(package);
+    let output = command
+        .output()
+        .map_err(|err| format!("failed to inspect entrypoints for {package}: {err}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let detail = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        return Err(format!(
+            "failed to inspect entrypoints for {package}{detail}"
+        ));
+    }
+    let mut entrypoints: Vec<String> = serde_json::from_slice(&output.stdout)
+        .map_err(|err| format!("failed to parse entrypoints for {package}: {err}"))?;
+    entrypoints.retain(|entrypoint| is_executable(&venv_root.join("bin").join(entrypoint)));
+    entrypoints.sort();
+    entrypoints.dedup();
+    Ok(entrypoints)
+}
+
+fn write_pip_entrypoint_stubs(
+    plan: &InstallPlan,
+    venv_root: &Path,
+    entrypoints: &[String],
+) -> Result<(), String> {
+    let bin_dir = plan.install_root.join("bin");
+    fs::create_dir_all(&bin_dir)
+        .map_err(|err| format!("failed to create {}: {err}", bin_dir.display()))?;
+    for entrypoint in entrypoints {
+        write_venv_stub(
+            plan,
+            &bin_dir.join(entrypoint),
+            &venv_root.join("bin").join(entrypoint),
+            venv_root,
+        )?;
+    }
+    Ok(())
 }
 
 fn build_sandboxed_npm_install_command(
@@ -3299,6 +3797,30 @@ fn write_stub(
         .map_err(|err| format!("failed to chmod {}: {err}", stub_path.display()))
 }
 
+fn write_venv_stub(
+    plan: &InstallPlan,
+    stub_path: &Path,
+    actual_path: &Path,
+    venv_root: &Path,
+) -> Result<(), String> {
+    let venv_bin = venv_root.join("bin");
+    let script = format!(
+        "{}VIRTUAL_ENV={}\nexport VIRTUAL_ENV\nunset PYTHONHOME\nPATH=\"{}:$PATH\"\nexport PATH\nexec {} \"$@\"\n",
+        stub_script_prelude(&format!("{STUB_HEADER} {}", plan.package_name)),
+        shell_quote(venv_root.to_string_lossy().as_ref()),
+        shell_double_quote_escape(venv_bin.to_string_lossy().as_ref()),
+        shell_quote(actual_path.to_string_lossy().as_ref()),
+    );
+    fs::write(stub_path, script)
+        .map_err(|err| format!("failed to write {}: {err}", stub_path.display()))?;
+    let mut permissions = fs::metadata(stub_path)
+        .map_err(|err| format!("failed to stat {}: {err}", stub_path.display()))?
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(stub_path, permissions)
+        .map_err(|err| format!("failed to chmod {}: {err}", stub_path.display()))
+}
+
 fn stub_script_prelude(header_line: &str) -> String {
     let lvl = PACKAGE_MAGINAT0R_LVL_ENV;
     format!(
@@ -3328,31 +3850,31 @@ fn print_x_usage(program: &str) {
 }
 
 fn print_i_usage(program: &str) {
-    println!("Usage: {program} [-f | --force] <package|brew:formula|npm:package>...");
+    println!("Usage: {program} [-f | --force] <package|brew:formula|npm:package|pip:package>...");
     println!();
     println!("Installs self-contained packages under {OPT_PKG_ROOT}.");
 }
 
 fn print_uninstall_usage(program: &str) {
-    println!("Usage: {program} <package|brew:formula|npm:package>...");
+    println!("Usage: {program} <package|brew:formula|npm:package|pip:package>...");
     println!();
     println!("Removes installed packages from {OPT_PKG_ROOT}.");
 }
 
 fn print_outdated_usage(program: &str) {
-    println!("Usage: {program} [package|brew:formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package|pip:package]...");
     println!();
     println!("Lists installed packages with newer versions available.");
 }
 
 fn print_update_usage(program: &str) {
-    println!("Usage: {program} [package|brew:formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package|pip:package]...");
     println!();
     println!("Reinstalls installed packages with newer versions available.");
 }
 
 fn print_list_usage(program: &str) {
-    println!("Usage: {program} [package|brew:formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package|pip:package]...");
     println!();
     println!("Lists installed packages with their versions.");
 }
@@ -5567,6 +6089,24 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_i_request_accepts_qualified_pip_package_names() {
+        let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
+        let request = parse_i_request_from_iter(
+            &invocation,
+            vec![OsString::from("pip:Psycopg2")].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(IRequest {
+                packages: vec![RequestedPackage::PipPackage("psycopg2".to_string())],
+                force: false,
+            })
+        );
+    }
+
+    #[test]
     fn parse_i_request_rejects_invalid_npm_package_name() {
         let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
         let request =
@@ -5575,6 +6115,35 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             request,
             Err("npm package names must not contain path separators".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_i_request_rejects_invalid_pip_package_name() {
+        let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
+        let request =
+            parse_i_request_from_iter(&invocation, vec![OsString::from("pip:foo/bar")].into_iter());
+
+        assert_eq!(
+            request,
+            Err("pip package names must not contain path separators".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_i_request_rejects_unsupported_pip_package_characters() {
+        let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
+        let request = parse_i_request_from_iter(
+            &invocation,
+            vec![OsString::from("pip:foo[bar]")].into_iter(),
+        );
+
+        assert_eq!(
+            request,
+            Err(
+                "pip package names may only contain ASCII letters, numbers, '.', '-' and '_'"
+                    .to_string()
+            )
         );
     }
 
@@ -5647,6 +6216,27 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_uninstall_request_accepts_qualified_pip_package_names() {
+        let invocation = Invocation {
+            binary_name: "p0r".to_string(),
+            name: "p0r rm".to_string(),
+            mode: None,
+        };
+        let request = parse_uninstall_request_from_iter(
+            &invocation,
+            vec![OsString::from("pip:Psycopg2")].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UninstallRequest {
+                packages: vec!["pip:psycopg2".to_string()],
+            })
+        );
+    }
+
+    #[test]
     fn parse_uninstall_request_rejects_paths() {
         let invocation = Invocation {
             binary_name: "p0r".to_string(),
@@ -5698,6 +6288,7 @@ package or `bar` for the package that provides the `foo` executable"
                 OsString::from(SELF_UPDATE_DISABLE_FLAG),
                 OsString::from("brew:python@3.12"),
                 OsString::from("npm:openclaw"),
+                OsString::from("pip:psycopg2"),
             ]
             .into_iter(),
         )
@@ -5710,6 +6301,7 @@ package or `bar` for the package that provides the `foo` executable"
                     RequestedPackage::Auto("ffmpeg".to_string()),
                     RequestedPackage::HomebrewFormula("python@3.12".to_string()),
                     RequestedPackage::NpmPackage("openclaw".to_string()),
+                    RequestedPackage::PipPackage("psycopg2".to_string()),
                 ]),
                 no_self_update: true,
             })
@@ -5777,6 +6369,7 @@ package or `bar` for the package that provides the `foo` executable"
                 OsString::from("ffmpeg"),
                 OsString::from("brew:python@3.12"),
                 OsString::from("npm:openclaw"),
+                OsString::from("pip:psycopg2"),
             ]
             .into_iter(),
             print_outdated_usage,
@@ -5790,6 +6383,7 @@ package or `bar` for the package that provides the `foo` executable"
                     RequestedPackage::Auto("ffmpeg".to_string()),
                     RequestedPackage::HomebrewFormula("python@3.12".to_string()),
                     RequestedPackage::NpmPackage("openclaw".to_string()),
+                    RequestedPackage::PipPackage("psycopg2".to_string()),
                 ]),
             })
         );
@@ -5814,6 +6408,7 @@ package or `bar` for the package that provides the `foo` executable"
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join("deno")).unwrap();
         fs::create_dir_all(temp.path().join("npm/openclaw")).unwrap();
+        fs::create_dir_all(temp.path().join("pip/psycopg2")).unwrap();
         fs::create_dir_all(temp.path().join(".tmp")).unwrap();
         fs::write(temp.path().join("README"), b"not a package").unwrap();
         write_package_receipt(
@@ -5827,12 +6422,27 @@ package or `bar` for the package that provides the `foo` executable"
             },
         )
         .unwrap();
+        write_package_receipt(
+            &temp.path().join("pip/psycopg2").join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "pip:psycopg2".to_string(),
+                version: "2.9.10".to_string(),
+                source: PackageReceiptSource::Pip {
+                    package_name: "psycopg2".to_string(),
+                },
+            },
+        )
+        .unwrap();
 
         let mut installed = installed_package_names(temp.path()).unwrap();
         installed.sort();
         assert_eq!(
             installed,
-            vec!["deno".to_string(), "npm:openclaw".to_string()]
+            vec![
+                "deno".to_string(),
+                "npm:openclaw".to_string(),
+                "pip:psycopg2".to_string()
+            ]
         );
     }
 
@@ -5936,6 +6546,14 @@ package or `bar` for the package that provides the `foo` executable"
             installed_version: "1.2.3".to_string(),
             latest_version: "1.2.4".to_string(),
         };
+        let pip = PackageStatus {
+            package_name: "psycopg2".to_string(),
+            source: PackageReceiptSource::Pip {
+                package_name: "psycopg2".to_string(),
+            },
+            installed_version: "2.9.9".to_string(),
+            latest_version: "2.9.10".to_string(),
+        };
 
         assert_eq!(
             requested_package_from_status(&formula),
@@ -5952,6 +6570,10 @@ package or `bar` for the package that provides the `foo` executable"
         assert_eq!(
             requested_package_from_status(&npm),
             RequestedPackage::NpmPackage("openclaw".to_string())
+        );
+        assert_eq!(
+            requested_package_from_status(&pip),
+            RequestedPackage::PipPackage("psycopg2".to_string())
         );
     }
 
@@ -6626,6 +7248,16 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn pip_package_install_data_supports_dependencies_and_python_formula() {
+        assert_eq!(
+            pip_package_homebrew_dependencies("Psycopg2"),
+            vec!["libpq".to_string()]
+        );
+        assert_eq!(pip_package_python_formula("psycopg2"), "python@3.12");
+        assert_eq!(pip_package_python_formula("unknown"), "python");
+    }
+
+    #[test]
     fn append_vendor_npm_homebrew_dependencies_uses_vendor_install_strategy() {
         let qmd = VendorInstall {
             package: vendor::get("qmd").unwrap(),
@@ -6636,6 +7268,18 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         append_vendor_npm_homebrew_dependencies(&mut formulas, &[qmd]);
 
         assert_eq!(formulas, vec!["sqlite".to_string()]);
+    }
+
+    #[test]
+    fn append_pip_package_homebrew_dependencies_uses_embedded_data() {
+        let mut formulas = vec!["python@3.12".to_string()];
+
+        append_pip_package_homebrew_dependencies(&mut formulas, "psycopg2");
+
+        assert_eq!(
+            formulas,
+            vec!["python@3.12".to_string(), "libpq".to_string()]
+        );
     }
 
     #[test]
@@ -6758,6 +7402,100 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         let profile_path = PathBuf::from(args[1]);
         assert!(profile_path.is_file());
         assert!(sandbox_root.path().join("npmrc").is_file());
+    }
+
+    #[test]
+    fn build_pip_commands_use_isolated_env() {
+        let temp = TempDir::new().unwrap();
+        let sandbox_root = temp.path().join("sandbox");
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "pip:psycopg2".to_string(),
+            root_formula: "pip:psycopg2".to_string(),
+            stable_root: temp.path().join("opt/pip/psycopg2"),
+            install_root: temp.path().join("opt/pip/psycopg2"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        fs::create_dir_all(&plan.tmp_root).unwrap();
+
+        let venv_command = build_pip_venv_command(
+            "/opt/pip/psycopg2/bin/python3",
+            &plan.install_root.join("venv"),
+            &sandbox_root,
+            &plan,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            venv_command.get_program(),
+            OsStr::new("/opt/pip/psycopg2/bin/python3")
+        );
+        let venv_args: Vec<_> = venv_command.get_args().collect();
+        assert_eq!(
+            venv_args,
+            vec![
+                OsStr::new("-m"),
+                OsStr::new("venv"),
+                OsStr::new("--copies"),
+                plan.install_root.join("venv").as_os_str(),
+            ]
+        );
+
+        let pip_command = build_pip_install_command(
+            &plan.install_root.join("venv/bin/pip"),
+            "psycopg2",
+            "2.9.10",
+            &sandbox_root,
+            &plan,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            pip_command.get_program(),
+            plan.install_root.join("venv/bin/pip").as_os_str()
+        );
+        let pip_args: Vec<_> = pip_command.get_args().collect();
+        assert_eq!(
+            pip_args,
+            vec![
+                OsStr::new("install"),
+                OsStr::new("--disable-pip-version-check"),
+                OsStr::new("--no-input"),
+                OsStr::new("psycopg2==2.9.10"),
+            ]
+        );
+
+        for command in [&venv_command, &pip_command] {
+            let envs: HashMap<_, _> = command
+                .get_envs()
+                .map(|(key, value)| {
+                    (
+                        key.to_owned(),
+                        value.map(|value| value.to_owned()).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            assert_eq!(
+                envs.get(OsStr::new("TMPDIR")).unwrap(),
+                plan.tmp_root.as_os_str()
+            );
+            assert_eq!(
+                envs.get(OsStr::new("HOME")).unwrap(),
+                sandbox_root.join("home").as_os_str()
+            );
+            assert_eq!(
+                envs.get(OsStr::new("XDG_CACHE_HOME")).unwrap(),
+                sandbox_root.join("xdg-cache").as_os_str()
+            );
+            assert_eq!(
+                envs.get(OsStr::new("PIP_CACHE_DIR")).unwrap(),
+                sandbox_root.join("pip-cache").as_os_str()
+            );
+            assert_eq!(
+                envs.get(OsStr::new("PYTHONNOUSERSITE")).unwrap(),
+                OsStr::new("1")
+            );
+        }
     }
 
     #[test]
@@ -7372,6 +8110,30 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn write_venv_stub_exports_virtualenv_before_execing_entrypoint() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "pip:psycopg2".to_string(),
+            root_formula: "pip:psycopg2".to_string(),
+            stable_root: temp.path().join("stable"),
+            install_root: temp.path().join("psycopg2"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        let stub_path = temp.path().join("psql-tool");
+        let venv_root = PathBuf::from("/opt/pip/psycopg2/venv");
+        let actual_path = venv_root.join("bin/psql-tool");
+
+        write_venv_stub(&plan, &stub_path, &actual_path, &venv_root).unwrap();
+
+        let script = fs::read_to_string(&stub_path).unwrap();
+        assert!(script.contains("VIRTUAL_ENV='/opt/pip/psycopg2/venv'\n"));
+        assert!(script.contains("unset PYTHONHOME\n"));
+        assert!(script.contains("PATH=\"/opt/pip/psycopg2/venv/bin:$PATH\"\n"));
+        assert!(script.contains("exec '/opt/pip/psycopg2/venv/bin/psql-tool' \"$@\"\n"));
+    }
+
+    #[test]
     fn write_stub_increments_package_maginat0r_level_and_blocks_fork_bombs() {
         let temp = TempDir::new().unwrap();
         let plan = InstallPlan {
@@ -7582,6 +8344,26 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
             plan.tmp_root,
             temp_root_for_target_root(
                 Path::new(OPT_NPM_ROOT),
+                Path::new(SYSTEM_TMP_ROOT),
+                Path::new(TMP_TOOL_ROOT),
+            )
+        );
+    }
+
+    #[test]
+    fn install_plan_for_i_pip_uses_dedicated_opt_root() {
+        let plan = InstallPlan::for_i_pip(
+            "pip:psycopg2".to_string(),
+            "pip:psycopg2".to_string(),
+            "psycopg2",
+        );
+
+        assert_eq!(plan.stable_root, PathBuf::from("/opt/pip/psycopg2"));
+        assert_eq!(plan.install_root, PathBuf::from("/opt/pip/psycopg2"));
+        assert_eq!(
+            plan.tmp_root,
+            temp_root_for_target_root(
+                Path::new(OPT_PIP_ROOT),
                 Path::new(SYSTEM_TMP_ROOT),
                 Path::new(TMP_TOOL_ROOT),
             )
@@ -8238,7 +9020,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
     }
 
     #[test]
-    fn vendor_and_npm_version_fetchers_use_fixture_metadata_servers() {
+    fn vendor_npm_and_pip_version_fetchers_use_fixture_metadata_servers() {
         let _env_lock = test_env_lock().lock().unwrap();
         let (base, server) = start_test_http_server(
             vec![
@@ -8270,12 +9052,17 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                     "/openclaw".to_string(),
                     br#"{"dist-tags":{"latest":"4.5.6"}}"#.to_vec(),
                 ),
+                (
+                    "/psycopg2/json".to_string(),
+                    br#"{"info":{"version":"2.9.10"}}"#.to_vec(),
+                ),
             ],
-            7,
+            8,
         );
         let _env = TestEnvGuard::set(&[
             ("PKG_GITHUB_API_ROOT", &base),
             ("PKG_NPM_REGISTRY_ROOT", &base),
+            ("PKG_PYPI_ROOT", &base),
         ]);
 
         assert_eq!(bun::version().unwrap(), Version::parse("1.2.3").unwrap());
@@ -8290,6 +9077,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         assert_eq!(
             resolve_npm_latest_version("openclaw").unwrap(),
             "4.5.6".to_string()
+        );
+        assert_eq!(
+            resolve_pip_latest_version("psycopg2").unwrap(),
+            "2.9.10".to_string()
         );
         server.join().unwrap();
     }
