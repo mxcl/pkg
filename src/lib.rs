@@ -1379,7 +1379,20 @@ fn parse_x_request(
 
 fn parse_x_request_from_iter<I>(
     invocation: &Invocation,
+    args: I,
+) -> Result<Option<XRequest>, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let db = load_db()?;
+    ensure_db_schema(&db)?;
+    parse_x_request_from_iter_with_db(invocation, args, &db)
+}
+
+fn parse_x_request_from_iter_with_db<I>(
+    invocation: &Invocation,
     mut args: I,
+    db: &Db,
 ) -> Result<Option<XRequest>, String>
 where
     I: Iterator<Item = OsString>,
@@ -1440,8 +1453,6 @@ where
         tool = base_tool;
         formula
     } else {
-        let db = load_db()?;
-        ensure_db_schema(&db)?;
         db.entries
             .get(&tool)
             .cloned()
@@ -7635,26 +7646,30 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
     #[test]
     fn parse_x_request_prefers_full_formula_variants() {
         let invocation = Invocation::for_subcommand("p0r", "x", Mode::X);
+        let db = test_db(&[("ffmpeg", "ffmpeg"), ("magick", "imagemagick")]);
 
-        let ffmpeg = parse_x_request_from_iter(
+        let ffmpeg = parse_x_request_from_iter_with_db(
             &invocation,
             vec![OsString::from("ffmpeg"), OsString::from("-version")].into_iter(),
+            &db,
         )
         .unwrap()
         .unwrap();
         assert_eq!(ffmpeg.root_formula, "ffmpeg-full");
 
-        let magick = parse_x_request_from_iter(
+        let magick = parse_x_request_from_iter_with_db(
             &invocation,
             vec![OsString::from("magick"), OsString::from("--version")].into_iter(),
+            &db,
         )
         .unwrap()
         .unwrap();
         assert_eq!(magick.root_formula, "imagemagick-full");
 
-        let explicit = parse_x_request_from_iter(
+        let explicit = parse_x_request_from_iter_with_db(
             &invocation,
             vec![OsString::from("+imagemagick"), OsString::from("convert")].into_iter(),
+            &db,
         )
         .unwrap()
         .unwrap();
