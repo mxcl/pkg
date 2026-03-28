@@ -71,6 +71,7 @@ const DB_SCHEMA_VERSION: u32 = 2;
 const EMBEDDED_DB: &[u8] = include_bytes!("../data/db.json");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
     include_str!("../data/post_install_check_skip.jsonc");
+const BREW_PACKAGE_PREFIX: &str = "brew:";
 const FORMULA_API_ROOT: &str = "https://formulae.brew.sh/api/formula";
 const FORMULA_API_INDEX_URL: &str = "https://formulae.brew.sh/api/formula.json";
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -1631,9 +1632,11 @@ fn parse_package_name(value: &OsString) -> Result<RequestedPackage, String> {
         .to_str()
         .ok_or_else(|| "package name must be valid UTF-8".to_string())?
         .to_string();
-    if let Some(formula) = package.strip_prefix("brew.sh/") {
+    if let Some(formula) = package.strip_prefix(BREW_PACKAGE_PREFIX) {
         if formula.is_empty() {
-            return Err("package qualifier 'brew.sh/' is missing a formula name".to_string());
+            return Err(format!(
+                "package qualifier '{BREW_PACKAGE_PREFIX}' is missing a formula name"
+            ));
         }
         if formula.contains('/') {
             return Err(
@@ -1656,9 +1659,11 @@ fn parse_uninstall_package_name(value: &OsString) -> Result<String, String> {
     let package = value
         .to_str()
         .ok_or_else(|| "package name must be valid UTF-8".to_string())?;
-    if let Some(formula) = package.strip_prefix("brew.sh/") {
+    if let Some(formula) = package.strip_prefix(BREW_PACKAGE_PREFIX) {
         if formula.is_empty() {
-            return Err("package qualifier 'brew.sh/' is missing a formula name".to_string());
+            return Err(format!(
+                "package qualifier '{BREW_PACKAGE_PREFIX}' is missing a formula name"
+            ));
         }
         if formula.contains('/') {
             return Err(
@@ -1772,7 +1777,7 @@ fn write_full_formula_recommendation<W: Write>(
     };
     writeln!(
         stderr,
-        "info: requested `{formula}`; `brew.sh/{recommended}` is recommended instead"
+        "info: requested `{formula}`; `{BREW_PACKAGE_PREFIX}{recommended}` is recommended instead"
     )
     .map_err(|err| format!("failed to write stderr: {err}"))
 }
@@ -3259,31 +3264,31 @@ fn print_x_usage(program: &str) {
 }
 
 fn print_i_usage(program: &str) {
-    println!("Usage: {program} [-f | --force] <package|brew.sh/formula|npm:package>...");
+    println!("Usage: {program} [-f | --force] <package|brew:formula|npm:package>...");
     println!();
     println!("Installs self-contained packages under {OPT_PKG_ROOT}.");
 }
 
 fn print_uninstall_usage(program: &str) {
-    println!("Usage: {program} <package|brew.sh/formula|npm:package>...");
+    println!("Usage: {program} <package|brew:formula|npm:package>...");
     println!();
     println!("Removes installed packages from {OPT_PKG_ROOT}.");
 }
 
 fn print_outdated_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package]...");
     println!();
     println!("Lists installed packages with newer versions available.");
 }
 
 fn print_update_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package]...");
     println!();
     println!("Reinstalls installed packages with newer versions available.");
 }
 
 fn print_list_usage(program: &str) {
-    println!("Usage: {program} [package|brew.sh/formula|npm:package]...");
+    println!("Usage: {program} [package|brew:formula|npm:package]...");
     println!();
     println!("Lists installed packages with their versions.");
 }
@@ -3719,7 +3724,7 @@ fn unsupported_formula_message(formula: &str) -> String {
 
 fn ambiguous_install_target_message(package: &str, executable_formula: &str) -> String {
     format!(
-        "ambiguous install target '{package}': use `brew.sh/{package}` for the Homebrew \
+        "ambiguous install target '{package}': use `{BREW_PACKAGE_PREFIX}{package}` for the Homebrew \
 package or `{executable_formula}` for the package that provides the `{package}` executable"
     )
 }
@@ -5285,7 +5290,7 @@ mod tests {
         assert_eq!(
             resolve_i_root_formula_with_db("foo", &db, |_| Ok(true)),
             Err(
-                "ambiguous install target 'foo': use `brew.sh/foo` for the Homebrew \
+                "ambiguous install target 'foo': use `brew:foo` for the Homebrew \
 package or `bar` for the package that provides the `foo` executable"
                     .to_string()
             )
@@ -5458,7 +5463,7 @@ package or `bar` for the package that provides the `foo` executable"
         let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
         let request = parse_i_request_from_iter(
             &invocation,
-            vec![OsString::from("brew.sh/zopflipng")].into_iter(),
+            vec![OsString::from("brew:zopflipng")].into_iter(),
         )
         .unwrap();
 
@@ -5512,11 +5517,11 @@ package or `bar` for the package that provides the `foo` executable"
     fn parse_i_request_rejects_empty_qualified_homebrew_formula_name() {
         let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
         let request =
-            parse_i_request_from_iter(&invocation, vec![OsString::from("brew.sh/")].into_iter());
+            parse_i_request_from_iter(&invocation, vec![OsString::from("brew:")].into_iter());
 
         assert_eq!(
             request,
-            Err("package qualifier 'brew.sh/' is missing a formula name".to_string())
+            Err("package qualifier 'brew:' is missing a formula name".to_string())
         );
     }
 
@@ -5525,7 +5530,7 @@ package or `bar` for the package that provides the `foo` executable"
         let invocation = Invocation::for_subcommand("p0r", "i", Mode::I);
         let request = parse_i_request_from_iter(
             &invocation,
-            vec![OsString::from("brew.sh/foo/bar")].into_iter(),
+            vec![OsString::from("brew:foo/bar")].into_iter(),
         );
 
         assert_eq!(
@@ -5543,7 +5548,7 @@ package or `bar` for the package that provides the `foo` executable"
         };
         let request = parse_uninstall_request_from_iter(
             &invocation,
-            vec![OsString::from("brew.sh/python@3.12")].into_iter(),
+            vec![OsString::from("brew:python@3.12")].into_iter(),
         )
         .unwrap();
 
@@ -5626,7 +5631,7 @@ package or `bar` for the package that provides the `foo` executable"
             vec![
                 OsString::from("ffmpeg"),
                 OsString::from(SELF_UPDATE_DISABLE_FLAG),
-                OsString::from("brew.sh/python@3.12"),
+                OsString::from("brew:python@3.12"),
                 OsString::from("npm:openclaw"),
             ]
             .into_iter(),
@@ -5705,7 +5710,7 @@ package or `bar` for the package that provides the `foo` executable"
             &invocation,
             vec![
                 OsString::from("ffmpeg"),
-                OsString::from("brew.sh/python@3.12"),
+                OsString::from("brew:python@3.12"),
                 OsString::from("npm:openclaw"),
             ]
             .into_iter(),
@@ -7343,8 +7348,8 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert_eq!(
             String::from_utf8(stderr).unwrap(),
-            "info: requested `ffmpeg`; `brew.sh/ffmpeg-full` is recommended instead\n\
-info: requested `imagemagick`; `brew.sh/imagemagick-full` is recommended instead\n"
+            "info: requested `ffmpeg`; `brew:ffmpeg-full` is recommended instead\n\
+info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         );
     }
 
