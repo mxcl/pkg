@@ -7927,17 +7927,14 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         run_package_post_install(&plan, &installs, &bin_dir).unwrap();
 
-        let python = fs::read_to_string(bin_dir.join("python")).unwrap();
-        assert!(python.contains("PACKAGE_MAGINAT0R_LVL=${PACKAGE_MAGINAT0R_LVL:-0}\n"));
-        assert!(python.contains("fork bomb prevented: $PACKAGE_MAGINAT0R_LVL exceeded 20"));
-        assert!(python.contains(&bin_dir.join("python3.13").display().to_string()));
-        assert!(python.contains(&bin_dir.join("python3.12").display().to_string()));
-        assert!(python.find("python3.13").unwrap() < python.find("python3.12").unwrap());
-
-        let pip = fs::read_to_string(bin_dir.join("pip")).unwrap();
-        assert!(pip.contains("PACKAGE_MAGINAT0R_LVL=${PACKAGE_MAGINAT0R_LVL:-0}\n"));
-        assert!(pip.contains(&bin_dir.join("pip3.13").display().to_string()));
-        assert!(pip.contains(&bin_dir.join("pip3.12").display().to_string()));
+        assert_eq!(
+            fs::read_link(bin_dir.join("python")).unwrap(),
+            bin_dir.join("python3")
+        );
+        assert_eq!(
+            fs::read_link(bin_dir.join("pip")).unwrap(),
+            bin_dir.join("pip3")
+        );
 
         assert_eq!(
             fs::read_link(bin_dir.join("python3")).unwrap(),
@@ -8174,17 +8171,19 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         remove_path(&python313).unwrap();
         refresh_post_uninstall_stubs(&opt_root, &bin_dir).unwrap();
 
-        let python = fs::read_to_string(bin_dir.join("python")).unwrap();
-        assert!(python.contains(&bin_dir.join("python3.12").display().to_string()));
-        assert!(!python.contains("python3.13"));
+        assert_eq!(
+            fs::read_link(bin_dir.join("python")).unwrap(),
+            bin_dir.join("python3")
+        );
         assert_eq!(
             fs::read_link(bin_dir.join("python3")).unwrap(),
             bin_dir.join("python3.12")
         );
 
-        let pip = fs::read_to_string(bin_dir.join("pip")).unwrap();
-        assert!(pip.contains(&bin_dir.join("pip3.12").display().to_string()));
-        assert!(!pip.contains("pip3.13"));
+        assert_eq!(
+            fs::read_link(bin_dir.join("pip")).unwrap(),
+            bin_dir.join("pip3")
+        );
         assert_eq!(
             fs::read_link(bin_dir.join("pip3")).unwrap(),
             bin_dir.join("pip3.12")
