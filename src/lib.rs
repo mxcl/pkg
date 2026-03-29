@@ -398,10 +398,13 @@ struct PackageStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct PackageInfo {
     package_name: String,
+    qualified_name: String,
     install_root: PathBuf,
     installed: bool,
     source: Option<PackageReceiptSource>,
     source_error: Option<String>,
+    aliases: Vec<String>,
+    aliases_error: Option<String>,
     installed_version: Option<String>,
     latest_version: Option<String>,
     latest_version_error: Option<String>,
@@ -2635,10 +2638,13 @@ fn resolve_installed_package_info(
 ) -> Result<PackageInfo, String> {
     let mut info = PackageInfo {
         package_name,
+        qualified_name: String::new(),
         install_root,
         installed: true,
         source: None,
         source_error: None,
+        aliases: Vec::new(),
+        aliases_error: None,
         installed_version: None,
         latest_version: None,
         latest_version_error: None,
@@ -2659,6 +2665,7 @@ fn resolve_installed_package_info(
     if info.source.is_none() {
         info.source = explicit_requested_package_source(requested);
     }
+    populate_package_info_identity(&mut info);
     populate_package_info_metadata(config, &mut info);
     Ok(info)
 }
@@ -2671,10 +2678,13 @@ fn resolve_uninstalled_package_info(
 ) -> PackageInfo {
     let mut info = PackageInfo {
         package_name,
+        qualified_name: String::new(),
         install_root,
         installed: false,
         source: None,
         source_error: None,
+        aliases: Vec::new(),
+        aliases_error: None,
         installed_version: None,
         latest_version: None,
         latest_version_error: None,
@@ -2686,8 +2696,20 @@ fn resolve_uninstalled_package_info(
         Ok(source) => info.source = Some(source),
         Err(err) => info.source_error = Some(err),
     }
+    populate_package_info_identity(&mut info);
     populate_package_info_metadata(config, &mut info);
     info
+}
+
+fn populate_package_info_identity(info: &mut PackageInfo) {
+    if let Some(source) = info.source.as_ref() {
+        info.qualified_name = package_source_qualified_name(source);
+        let (aliases, alias_error) = resolve_aliases_for_source(source);
+        info.aliases = aliases;
+        info.aliases_error = alias_error;
+    } else {
+        info.qualified_name = info.package_name.clone();
+    }
 }
 
 fn populate_package_info_metadata(config: &Config, info: &mut PackageInfo) {
@@ -2780,6 +2802,54 @@ fn resolve_latest_version_for_source(
     }
 }
 
+fn package_source_qualified_name(source: &PackageReceiptSource) -> String {
+    match source {
+        PackageReceiptSource::Formula { root_formula } => {
+            format!("{BREW_PACKAGE_PREFIX}{root_formula}")
+        }
+        PackageReceiptSource::Vendor { vendor_name } => format!("subs:{vendor_name}"),
+        PackageReceiptSource::Npm { package_name } => npm_package_display_name(package_name),
+        PackageReceiptSource::Pip { package_name } => pip_package_display_name(package_name),
+    }
+}
+
+fn resolve_aliases_for_source(source: &PackageReceiptSource) -> (Vec<String>, Option<String>) {
+    let mut aliases = our_aliases_for_source(source);
+    let mut alias_error = None;
+
+    if let PackageReceiptSource::Formula { root_formula } = source {
+        match homebrew_aliases_for_formula(root_formula) {
+            Ok(mut brew_aliases) => aliases.append(&mut brew_aliases),
+            Err(err) => alias_error = Some(err),
+        }
+    }
+
+    aliases.sort();
+    aliases.dedup();
+    (aliases, alias_error)
+}
+
+fn our_aliases_for_source(source: &PackageReceiptSource) -> Vec<String> {
+    let qualified_name = package_source_qualified_name(source);
+    let mut aliases = embedded_package_aliases()
+        .iter()
+        .filter_map(|(alias, target)| {
+            (target.display_name() == qualified_name).then_some(alias.clone())
+        })
+        .collect::<Vec<_>>();
+    aliases.sort();
+    aliases
+}
+
+fn homebrew_aliases_for_formula(formula: &str) -> Result<Vec<String>, String> {
+    let mut aliases = formula_alias_index()?
+        .iter()
+        .filter_map(|(alias, canonical)| (canonical == formula).then_some(alias.clone()))
+        .collect::<Vec<_>>();
+    aliases.sort();
+    Ok(aliases)
+}
+
 fn homebrew_package_info_from_formula_info(
     formula: &str,
     info: &FormulaInfo,
@@ -2808,9 +2878,13 @@ fn string_or_none(value: &str) -> Option<String> {
 
 fn format_package_info(info: &PackageInfo) -> String {
     let mut lines = vec![
-        format!("package: {}", info.package_name),
+        format!("package: {}", info.qualified_name),
         format!("install_root: {}", info.install_root.display()),
         format!("installed: {}", yes_no(info.installed)),
+        format!(
+            "aliases: {}",
+            format_aliases(&info.aliases, info.aliases_error.as_deref())
+        ),
         format!(
             "installed_version: {}",
             format_optional_field(info.installed_version.as_deref(), None)
@@ -2910,6 +2984,16 @@ fn format_dependencies(dependencies: &[String]) -> String {
         "none".to_string()
     } else {
         dependencies.join(", ")
+    }
+}
+
+fn format_aliases(aliases: &[String], err: Option<&str>) -> String {
+    if !aliases.is_empty() {
+        aliases.join(", ")
+    } else if let Some(err) = err {
+        format!("unknown ({err})")
+    } else {
+        "none".to_string()
     }
 }
 
@@ -7262,12 +7346,15 @@ or `npm:clawhub` for the aliased package"
     fn format_package_info_reports_homebrew_metadata() {
         let info = PackageInfo {
             package_name: "ffmpeg".to_string(),
+            qualified_name: "brew:ffmpeg".to_string(),
             install_root: PathBuf::from("/opt/ffmpeg"),
             installed: true,
             source: Some(PackageReceiptSource::Formula {
                 root_formula: "ffmpeg".to_string(),
             }),
             source_error: None,
+            aliases: vec!["ffmpeg4".to_string()],
+            aliases_error: None,
             installed_version: Some("7.1".to_string()),
             latest_version: Some("7.2".to_string()),
             latest_version_error: None,
@@ -7285,9 +7372,10 @@ or `npm:clawhub` for the aliased package"
         assert_eq!(
             format_package_info(&info),
             concat!(
-                "package: ffmpeg\n",
+                "package: brew:ffmpeg\n",
                 "install_root: /opt/ffmpeg\n",
                 "installed: yes\n",
+                "aliases: ffmpeg4\n",
                 "installed_version: 7.1\n",
                 "source: homebrew formula ffmpeg\n",
                 "latest_version: 7.2\n",
@@ -7308,12 +7396,15 @@ or `npm:clawhub` for the aliased package"
     fn format_package_info_reports_unavailable_homebrew_metadata() {
         let info = PackageInfo {
             package_name: "foo".to_string(),
+            qualified_name: "brew:foo".to_string(),
             install_root: PathBuf::from("/opt/foo"),
             installed: false,
             source: Some(PackageReceiptSource::Formula {
                 root_formula: "foo".to_string(),
             }),
             source_error: None,
+            aliases: Vec::new(),
+            aliases_error: Some("failed to fetch Homebrew formula index".to_string()),
             installed_version: None,
             latest_version: None,
             latest_version_error: Some("failed to fetch formula metadata".to_string()),
@@ -7323,14 +7414,48 @@ or `npm:clawhub` for the aliased package"
 
         assert_eq!(
             format_package_info(&info),
-            "package: foo\n\
+            "package: brew:foo\n\
 install_root: /opt/foo\n\
 installed: no\n\
+aliases: unknown (failed to fetch Homebrew formula index)\n\
 installed_version: unknown\n\
 source: homebrew formula foo\n\
 latest_version: unknown (failed to fetch formula metadata)\n\
 outdated: n/a\n\
 homebrew_metadata: unavailable (failed to fetch formula metadata)\n"
+        );
+    }
+
+    #[test]
+    fn format_package_info_reports_vendor_package_with_subs_prefix() {
+        let info = PackageInfo {
+            package_name: "deno".to_string(),
+            qualified_name: "subs:deno".to_string(),
+            install_root: PathBuf::from("/opt/deno"),
+            installed: false,
+            source: Some(PackageReceiptSource::Vendor {
+                vendor_name: "deno".to_string(),
+            }),
+            source_error: None,
+            aliases: Vec::new(),
+            aliases_error: None,
+            installed_version: None,
+            latest_version: Some("2.7.9".to_string()),
+            latest_version_error: None,
+            homebrew_info: None,
+            homebrew_info_error: None,
+        };
+
+        assert_eq!(
+            format_package_info(&info),
+            "package: subs:deno\n\
+install_root: /opt/deno\n\
+installed: no\n\
+aliases: none\n\
+installed_version: unknown\n\
+source: vendor package deno\n\
+latest_version: 2.7.9\n\
+outdated: n/a\n"
         );
     }
 
