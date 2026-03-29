@@ -1,0 +1,5 @@
+{
+  "clawhub": "npm:clawhub",
+  "openclaw": "npm:openclaw",
+  "qmd": "npm:@tobilu/qmd"
+}

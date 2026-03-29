@@ -69,6 +69,7 @@ mod post_install_hooks {
 
 const DB_SCHEMA_VERSION: u32 = 2;
 const EMBEDDED_DB: &[u8] = include_bytes!("../data/db.json");
+const EMBEDDED_ALIASES: &str = include_str!("../data/aliases.json");
 const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.json");
 const EMBEDDED_PIP_DATA: &str = include_str!("../data/pip.json");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
@@ -125,6 +126,7 @@ const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 const SAFE_BINARY_PATH_BYTES: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._+-/@";
 static POST_INSTALL_CHECK_SKIP: OnceLock<HashSet<String>> = OnceLock::new();
+static PACKAGE_ALIASES: OnceLock<HashMap<String, PackageAliasTarget>> = OnceLock::new();
 static NPM_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
 static PIP_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
 static FORMULA_ALIAS_INDEX: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
@@ -292,8 +294,19 @@ struct XRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum PackageAliasTarget {
+    HomebrewFormula(String),
+    NpmPackage(String),
+    PipPackage(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum RequestedPackage {
     Auto(String),
+    Alias {
+        alias: String,
+        target: PackageAliasTarget,
+    },
     HomebrewFormula(String),
     NpmPackage(String),
     PipPackage(String),
@@ -943,15 +956,15 @@ fn run_i(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
 }
 
 fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> Result<(), String> {
-    let package_name = requested_package_name(&requested);
-    prepare_install_target(
-        Path::new(OPT_PKG_ROOT),
-        &package_name,
-        force,
-        Path::new(USR_LOCAL_BIN),
-    )?;
+    let rollback_name = requested_package_name(&requested);
     let result = match requested {
         RequestedPackage::Auto(package_name) => {
+            prepare_install_target(
+                Path::new(OPT_PKG_ROOT),
+                &package_name,
+                force,
+                Path::new(USR_LOCAL_BIN),
+            )?;
             if let Some(package) = vendor::get(&package_name) {
                 run_i_vendor(config, package_name.clone(), package)
             } else {
@@ -959,20 +972,44 @@ fn run_i_package(config: &Config, requested: RequestedPackage, force: bool) -> R
                 run_i_formula(config, package_name.clone(), root_formula)
             }
         }
+        RequestedPackage::Alias { alias, target } => {
+            ensure_alias_install_target_unambiguous(&alias, &target)?;
+            run_i_package(config, target.into_requested_package(), force)
+        }
         RequestedPackage::HomebrewFormula(formula) => {
+            prepare_install_target(
+                Path::new(OPT_PKG_ROOT),
+                &formula,
+                force,
+                Path::new(USR_LOCAL_BIN),
+            )?;
             run_i_formula(config, formula.clone(), formula)
         }
         RequestedPackage::NpmPackage(npm_package) => {
+            let package_name = npm_package_display_name(&npm_package);
+            prepare_install_target(
+                Path::new(OPT_PKG_ROOT),
+                &package_name,
+                force,
+                Path::new(USR_LOCAL_BIN),
+            )?;
             run_i_npm(config, package_name.clone(), npm_package)
         }
         RequestedPackage::PipPackage(pip_package) => {
+            let package_name = pip_package_display_name(&pip_package);
+            prepare_install_target(
+                Path::new(OPT_PKG_ROOT),
+                &package_name,
+                force,
+                Path::new(USR_LOCAL_BIN),
+            )?;
             run_i_pip(config, package_name.clone(), pip_package)
         }
     };
     if let Err(err) = result {
         rollback_failed_install(
             Path::new(OPT_PKG_ROOT),
-            &package_name,
+            &rollback_name,
             Path::new(USR_LOCAL_BIN),
         )
         .map_err(|cleanup_err| format!("{err}\ncleanup failed: {cleanup_err}"))?;
@@ -1830,6 +1867,14 @@ fn parse_package_name(value: &OsString) -> Result<RequestedPackage, String> {
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
     }
+    if vendor::get(&package).is_none() {
+        if let Some(target) = package_alias_target(&package) {
+            return Ok(RequestedPackage::Alias {
+                alias: package,
+                target: target.clone(),
+            });
+        }
+    }
     Ok(RequestedPackage::Auto(package))
 }
 
@@ -1862,6 +1907,11 @@ fn parse_uninstall_package_name(value: &OsString) -> Result<String, String> {
     }
     if package.contains('/') {
         return Err("package name must not contain path separators".to_string());
+    }
+    if vendor::get(package).is_none() {
+        if let Some(target) = package_alias_target(package) {
+            return Ok(target.display_name());
+        }
     }
     Ok(package.to_string())
 }
@@ -1940,6 +1990,69 @@ fn pip_package_install_leaf_name(package: &str) -> String {
     normalize_pip_package_name(package)
 }
 
+impl PackageAliasTarget {
+    fn display_name(&self) -> String {
+        match self {
+            Self::HomebrewFormula(formula) => format!("{BREW_PACKAGE_PREFIX}{formula}"),
+            Self::NpmPackage(package) => npm_package_display_name(package),
+            Self::PipPackage(package) => pip_package_display_name(package),
+        }
+    }
+
+    fn into_requested_package(self) -> RequestedPackage {
+        match self {
+            Self::HomebrewFormula(formula) => RequestedPackage::HomebrewFormula(formula),
+            Self::NpmPackage(package) => RequestedPackage::NpmPackage(package),
+            Self::PipPackage(package) => RequestedPackage::PipPackage(package),
+        }
+    }
+}
+
+fn embedded_package_aliases() -> &'static HashMap<String, PackageAliasTarget> {
+    PACKAGE_ALIASES.get_or_init(|| {
+        serde_json::from_str::<HashMap<String, String>>(EMBEDDED_ALIASES)
+            .expect("failed to parse embedded package aliases JSON")
+            .into_iter()
+            .map(|(alias, target)| {
+                let parsed = parse_package_alias_target(&target)
+                    .unwrap_or_else(|err| panic!("invalid alias target {target}: {err}"));
+                (alias, parsed)
+            })
+            .collect()
+    })
+}
+
+fn package_alias_target(package: &str) -> Option<&'static PackageAliasTarget> {
+    embedded_package_aliases().get(package)
+}
+
+fn parse_package_alias_target(value: &str) -> Result<PackageAliasTarget, String> {
+    if let Some(formula) = value.strip_prefix(BREW_PACKAGE_PREFIX) {
+        if formula.is_empty() {
+            return Err(format!(
+                "package qualifier '{BREW_PACKAGE_PREFIX}' is missing a formula name"
+            ));
+        }
+        if formula.contains('/') {
+            return Err(
+                "qualified package name must not contain additional path separators".to_string(),
+            );
+        }
+        return Ok(PackageAliasTarget::HomebrewFormula(formula.to_string()));
+    }
+    if let Some(npm_package) = value.strip_prefix("npm:") {
+        validate_npm_package_name(npm_package)?;
+        return Ok(PackageAliasTarget::NpmPackage(npm_package.to_string()));
+    }
+    if let Some(pip_package) = value.strip_prefix("pip:") {
+        validate_pip_package_name(pip_package)?;
+        return Ok(PackageAliasTarget::PipPackage(normalize_pip_package_name(
+            pip_package,
+        )));
+    }
+    Err("alias targets must use a package qualifier".to_string())
+}
+
 fn package_install_root(opt_root: &Path, package_name: &str) -> Result<PathBuf, String> {
     if let Some(npm_package) = package_name.strip_prefix("npm:") {
         validate_npm_package_name(npm_package)?;
@@ -1962,6 +2075,15 @@ fn resolve_i_root_formula(package: &str) -> Result<String, String> {
     resolve_i_root_formula_with_db(package, &db, formula_metadata_exists)
 }
 
+fn ensure_alias_install_target_unambiguous(
+    alias: &str,
+    target: &PackageAliasTarget,
+) -> Result<(), String> {
+    let db = load_db()?;
+    ensure_db_schema(&db)?;
+    ensure_alias_install_target_unambiguous_with_db(alias, target, &db, formula_metadata_exists)
+}
+
 fn resolve_i_root_formula_with_db<F>(
     package: &str,
     db: &Db,
@@ -1980,6 +2102,27 @@ where
         return Err(ambiguous_install_target_message(package, formula));
     }
     Ok(formula.clone())
+}
+
+fn ensure_alias_install_target_unambiguous_with_db<F>(
+    alias: &str,
+    target: &PackageAliasTarget,
+    db: &Db,
+    formula_exists: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&str) -> Result<bool, String>,
+{
+    if let Some(formula) = db.entries.get(alias) {
+        if formula == alias {
+            return Err(ambiguous_alias_formula_message(alias, target));
+        }
+        return Err(ambiguous_alias_executable_message(alias, formula, target));
+    }
+    if formula_exists(alias)? {
+        return Err(ambiguous_alias_formula_message(alias, target));
+    }
+    Ok(())
 }
 
 fn recommended_full_formula(formula: &str) -> Option<&'static str> {
@@ -2339,6 +2482,7 @@ fn requested_package_name(package: &RequestedPackage) -> String {
         RequestedPackage::Auto(package_name) | RequestedPackage::HomebrewFormula(package_name) => {
             package_name.clone()
         }
+        RequestedPackage::Alias { target, .. } => target.display_name(),
         RequestedPackage::NpmPackage(package_name) => npm_package_display_name(package_name),
         RequestedPackage::PipPackage(package_name) => pip_package_display_name(package_name),
     }
@@ -4484,6 +4628,26 @@ package or `{executable_formula}` for the package that provides the `{package}` 
     )
 }
 
+fn ambiguous_alias_formula_message(package: &str, target: &PackageAliasTarget) -> String {
+    format!(
+        "ambiguous install target '{package}': use `{BREW_PACKAGE_PREFIX}{package}` for the Homebrew \
+package or `{}` for the aliased package",
+        target.display_name()
+    )
+}
+
+fn ambiguous_alias_executable_message(
+    package: &str,
+    executable_formula: &str,
+    target: &PackageAliasTarget,
+) -> String {
+    format!(
+        "ambiguous install target '{package}': use `{executable_formula}` for the Homebrew package \
+that provides the `{package}` executable or `{}` for the aliased package",
+        target.display_name()
+    )
+}
+
 fn formula_has_unsupported_install_hooks(
     formula: &str,
     info: &FormulaInfo,
@@ -6064,6 +6228,56 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn ensure_alias_install_target_unambiguous_accepts_unclaimed_aliases() {
+        let db = test_db(&[]);
+        assert!(
+            ensure_alias_install_target_unambiguous_with_db(
+                "clawhub",
+                &PackageAliasTarget::NpmPackage("clawhub".to_string()),
+                &db,
+                |_| Ok(false),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn ensure_alias_install_target_unambiguous_rejects_brew_executable_collisions() {
+        let db = test_db(&[("openclaw", "openclaw-cli")]);
+        assert_eq!(
+            ensure_alias_install_target_unambiguous_with_db(
+                "openclaw",
+                &PackageAliasTarget::NpmPackage("openclaw".to_string()),
+                &db,
+                |_| Ok(false),
+            ),
+            Err(
+                "ambiguous install target 'openclaw': use `openclaw-cli` for the Homebrew package \
+that provides the `openclaw` executable or `npm:openclaw` for the aliased package"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn ensure_alias_install_target_unambiguous_rejects_formula_collisions() {
+        let db = test_db(&[]);
+        assert_eq!(
+            ensure_alias_install_target_unambiguous_with_db(
+                "clawhub",
+                &PackageAliasTarget::NpmPackage("clawhub".to_string()),
+                &db,
+                |_| Ok(true),
+            ),
+            Err(
+                "ambiguous install target 'clawhub': use `brew:clawhub` for the Homebrew package \
+or `npm:clawhub` for the aliased package"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
     fn collect_formula_aliases_maps_aliases_to_canonical_formula_names() {
         let aliases = collect_formula_aliases(vec![formula_index_entry(
             "python@3.14",
@@ -6234,6 +6448,41 @@ package or `bar` for the package that provides the `foo` executable"
     }
 
     #[test]
+    fn parse_i_request_accepts_alias_package_names() {
+        let invocation = Invocation::for_subcommand("subs", "i", Mode::I);
+        let request =
+            parse_i_request_from_iter(&invocation, vec![OsString::from("clawhub")].into_iter())
+                .unwrap();
+
+        assert_eq!(
+            request,
+            Some(IRequest {
+                packages: vec![RequestedPackage::Alias {
+                    alias: "clawhub".to_string(),
+                    target: PackageAliasTarget::NpmPackage("clawhub".to_string()),
+                }],
+                force: false,
+            })
+        );
+    }
+
+    #[test]
+    fn parse_i_request_prefers_vendor_packages_over_aliases() {
+        let invocation = Invocation::for_subcommand("subs", "i", Mode::I);
+        let request =
+            parse_i_request_from_iter(&invocation, vec![OsString::from("qmd")].into_iter())
+                .unwrap();
+
+        assert_eq!(
+            request,
+            Some(IRequest {
+                packages: vec![RequestedPackage::Auto("qmd".to_string())],
+                force: false,
+            })
+        );
+    }
+
+    #[test]
     fn parse_i_request_accepts_qualified_npm_package_names() {
         let invocation = Invocation::for_subcommand("subs", "i", Mode::I);
         let request = parse_i_request_from_iter(
@@ -6381,6 +6630,46 @@ package or `bar` for the package that provides the `foo` executable"
             request,
             Some(UninstallRequest {
                 packages: vec!["npm:@tobilu/qmd".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_uninstall_request_accepts_alias_package_names() {
+        let invocation = Invocation {
+            binary_name: "subs".to_string(),
+            name: "subs rm".to_string(),
+            mode: None,
+        };
+        let request = parse_uninstall_request_from_iter(
+            &invocation,
+            vec![OsString::from("clawhub")].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UninstallRequest {
+                packages: vec!["npm:clawhub".to_string()],
+            })
+        );
+    }
+
+    #[test]
+    fn parse_uninstall_request_prefers_vendor_packages_over_aliases() {
+        let invocation = Invocation {
+            binary_name: "subs".to_string(),
+            name: "subs rm".to_string(),
+            mode: None,
+        };
+        let request =
+            parse_uninstall_request_from_iter(&invocation, vec![OsString::from("qmd")].into_iter())
+                .unwrap();
+
+        assert_eq!(
+            request,
+            Some(UninstallRequest {
+                packages: vec!["qmd".to_string()],
             })
         );
     }
@@ -7415,6 +7704,22 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             vec!["sqlite".to_string()]
         );
         assert!(npm_package_homebrew_dependencies("openclaw").is_empty());
+    }
+
+    #[test]
+    fn embedded_package_aliases_load_expected_entries() {
+        assert_eq!(
+            package_alias_target("openclaw"),
+            Some(&PackageAliasTarget::NpmPackage("openclaw".to_string()))
+        );
+        assert_eq!(
+            package_alias_target("clawhub"),
+            Some(&PackageAliasTarget::NpmPackage("clawhub".to_string()))
+        );
+        assert_eq!(
+            package_alias_target("qmd"),
+            Some(&PackageAliasTarget::NpmPackage("@tobilu/qmd".to_string()))
+        );
     }
 
     #[test]
