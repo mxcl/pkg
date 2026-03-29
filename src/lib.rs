@@ -2068,6 +2068,49 @@ fn package_stub_exclusions(package_name: &str) -> HashSet<String> {
         .unwrap_or_default()
 }
 
+fn imagemagick_stub_exclusions(
+    plan: &InstallPlan,
+    current: &[(String, PathBuf)],
+) -> HashSet<String> {
+    if !should_only_stub_magick(plan) {
+        return HashSet::new();
+    }
+
+    current
+        .iter()
+        .filter_map(|(name, _)| (name != "magick").then(|| name.clone()))
+        .collect()
+}
+
+fn should_only_stub_magick(plan: &InstallPlan) -> bool {
+    match plan.root_formula.as_str() {
+        "imagemagick-full" => true,
+        "imagemagick" => installed_formula_major_version(plan).is_some_and(|major| major >= 7),
+        _ => false,
+    }
+}
+
+fn installed_formula_major_version(plan: &InstallPlan) -> Option<u64> {
+    let receipt = load_package_receipt(&plan.root_receipt_path())
+        .ok()
+        .flatten()?;
+    let PackageReceiptSource::Formula { root_formula } = receipt.source else {
+        return None;
+    };
+    if root_formula != plan.root_formula {
+        return None;
+    }
+    parse_homebrew_major_version(&receipt.version)
+}
+
+fn parse_homebrew_major_version(version: &str) -> Option<u64> {
+    let trimmed = version.strip_prefix('v').unwrap_or(version);
+    trimmed
+        .split(|ch: char| !ch.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|major| major.parse().ok())
+}
+
 fn versioned_python_stub_exclusions(formula: &str) -> HashSet<String> {
     let Some((major, minor)) = parse_python_formula_version(formula) else {
         return HashSet::new();
@@ -3635,7 +3678,6 @@ fn sync_stubs(
 
     fs::create_dir_all(USR_LOCAL_BIN)
         .map_err(|err| format!("failed to create {}: {err}", USR_LOCAL_BIN))?;
-    let excluded_stubs = formula_stub_exclusions(&plan.root_formula);
     let current = if plan.mode == Mode::I {
         let manifest = load_root_executable_manifest(&plan.root_executables_manifest_path())?;
         if manifest.stubs.is_empty() {
@@ -3649,6 +3691,8 @@ fn sync_stubs(
     } else {
         collect_root_executables(&plan.stable_root)?
     };
+    let mut excluded_stubs = formula_stub_exclusions(&plan.root_formula);
+    excluded_stubs.extend(imagemagick_stub_exclusions(plan, &current));
     let current = filter_stub_executables(current, &excluded_stubs);
     for stub in previous_stubs {
         if !current.iter().any(|(name, _)| name == stub) {
@@ -7675,6 +7719,14 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn formula_stub_exclusions_alias_ffmpeg_to_ffmpeg_full() {
+        assert_eq!(
+            formula_stub_exclusions("ffmpeg"),
+            formula_stub_exclusions("ffmpeg-full")
+        );
+    }
+
+    #[test]
     fn formula_stub_exclusions_cover_dead_python_tools() {
         let exclusions = formula_stub_exclusions("python@3.12");
 
@@ -7696,6 +7748,93 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert!(!exclusions.contains("python3.12"));
         assert!(!exclusions.contains("pip3.12"));
+    }
+
+    #[test]
+    fn imagemagick_full_only_stubs_magick() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "imagemagick-full".to_string(),
+            root_formula: "imagemagick-full".to_string(),
+            stable_root: temp.path().join("opt/imagemagick-full"),
+            install_root: temp.path().join("opt/imagemagick-full"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        let current = vec![
+            ("convert".to_string(), PathBuf::from("/tmp/bin/convert")),
+            ("magick".to_string(), PathBuf::from("/tmp/bin/magick")),
+            ("identify".to_string(), PathBuf::from("/tmp/bin/identify")),
+        ];
+
+        assert_eq!(
+            imagemagick_stub_exclusions(&plan, &current),
+            HashSet::from(["convert".to_string(), "identify".to_string()])
+        );
+    }
+
+    #[test]
+    fn imagemagick_v7_only_stubs_magick() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "imagemagick".to_string(),
+            root_formula: "imagemagick".to_string(),
+            stable_root: temp.path().join("opt/imagemagick"),
+            install_root: temp.path().join("opt/imagemagick"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        write_package_receipt(
+            &plan.root_receipt_path(),
+            &PackageReceipt {
+                package_name: "imagemagick".to_string(),
+                version: "7.1.2_3".to_string(),
+                source: PackageReceiptSource::Formula {
+                    root_formula: "imagemagick".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        let current = vec![
+            ("convert".to_string(), PathBuf::from("/tmp/bin/convert")),
+            ("magick".to_string(), PathBuf::from("/tmp/bin/magick")),
+            ("mogrify".to_string(), PathBuf::from("/tmp/bin/mogrify")),
+        ];
+
+        assert_eq!(
+            imagemagick_stub_exclusions(&plan, &current),
+            HashSet::from(["convert".to_string(), "mogrify".to_string()])
+        );
+    }
+
+    #[test]
+    fn imagemagick_v6_keeps_legacy_stubs() {
+        let temp = TempDir::new().unwrap();
+        let plan = InstallPlan {
+            mode: Mode::I,
+            package_name: "imagemagick".to_string(),
+            root_formula: "imagemagick".to_string(),
+            stable_root: temp.path().join("opt/imagemagick"),
+            install_root: temp.path().join("opt/imagemagick"),
+            tmp_root: temp.path().join("tmp"),
+        };
+        write_package_receipt(
+            &plan.root_receipt_path(),
+            &PackageReceipt {
+                package_name: "imagemagick".to_string(),
+                version: "6.9.13_7".to_string(),
+                source: PackageReceiptSource::Formula {
+                    root_formula: "imagemagick".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        let current = vec![
+            ("convert".to_string(), PathBuf::from("/tmp/bin/convert")),
+            ("magick".to_string(), PathBuf::from("/tmp/bin/magick")),
+        ];
+
+        assert!(imagemagick_stub_exclusions(&plan, &current).is_empty());
     }
 
     #[test]
