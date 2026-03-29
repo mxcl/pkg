@@ -2046,10 +2046,12 @@ fn embedded_stub_exclusions() -> &'static HashMap<String, HashSet<String>> {
 }
 
 fn formula_stub_exclusions(formula: &str) -> HashSet<String> {
-    embedded_stub_exclusions()
+    let mut exclusions = embedded_stub_exclusions()
         .get(&format!("{BREW_PACKAGE_PREFIX}{formula}"))
         .cloned()
-        .unwrap_or_default()
+        .unwrap_or_default();
+    exclusions.extend(versioned_python_stub_exclusions(formula));
+    exclusions
 }
 
 fn vendor_stub_exclusions(package: &vendor::VendorPackage) -> HashSet<String> {
@@ -2064,6 +2066,34 @@ fn package_stub_exclusions(package_name: &str) -> HashSet<String> {
         .get(package_name)
         .cloned()
         .unwrap_or_default()
+}
+
+fn versioned_python_stub_exclusions(formula: &str) -> HashSet<String> {
+    let Some((major, minor)) = parse_python_formula_version(formula) else {
+        return HashSet::new();
+    };
+
+    [
+        "2to3".to_string(),
+        format!("2to3-{major}.{minor}"),
+        format!("idle{major}"),
+        format!("idle{major}.{minor}"),
+        format!("pydoc{major}"),
+        format!("pydoc{major}.{minor}"),
+        format!("python{major}-config"),
+        format!("python{major}.{minor}-config"),
+    ]
+    .into_iter()
+    .collect()
+}
+
+fn parse_python_formula_version(formula: &str) -> Option<(u64, u64)> {
+    let version = formula.strip_prefix("python@")?;
+    let (major, minor) = version.split_once('.')?;
+    if minor.contains('.') {
+        return None;
+    }
+    Some((major.parse().ok()?, minor.parse().ok()?))
 }
 
 fn embedded_npm_package_data() -> &'static HashMap<String, PackageInstallData> {
@@ -7639,6 +7669,27 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             formula_stub_exclusions("bash"),
             HashSet::from(["bashbug".to_string()])
         );
+    }
+
+    #[test]
+    fn formula_stub_exclusions_cover_dead_python_tools() {
+        let exclusions = formula_stub_exclusions("python@3.12");
+
+        for name in [
+            "2to3",
+            "2to3-3.12",
+            "idle3",
+            "idle3.12",
+            "pydoc3",
+            "pydoc3.12",
+            "python3-config",
+            "python3.12-config",
+        ] {
+            assert!(exclusions.contains(name), "missing exclusion for {name}");
+        }
+
+        assert!(!exclusions.contains("python3.12"));
+        assert!(!exclusions.contains("pip3.12"));
     }
 
     #[test]
