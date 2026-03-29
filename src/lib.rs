@@ -69,7 +69,7 @@ mod post_install_hooks {
 
 const DB_SCHEMA_VERSION: u32 = 2;
 const EMBEDDED_DB: &[u8] = include_bytes!("../data/db.json");
-const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.js");
+const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.json");
 const EMBEDDED_PIP_DATA: &str = include_str!("../data/pip.json");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
     include_str!("../data/post_install_check_skip.jsonc");
