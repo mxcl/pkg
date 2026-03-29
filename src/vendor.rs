@@ -133,6 +133,8 @@ pub mod gh;
 pub mod node;
 #[path = "../vendor/qmd.rs"]
 pub mod qmd;
+#[path = "../vendor/yoink.rs"]
+pub mod yoink;
 
 pub static PACKAGES: &[&VendorEntry] = &[
     &bun::ENTRY,
@@ -141,6 +143,7 @@ pub static PACKAGES: &[&VendorEntry] = &[
     &gh::ENTRY,
     &node::ENTRY,
     &qmd::ENTRY,
+    &yoink::ENTRY,
 ];
 
 pub fn get(name: &str) -> Option<VendorPackage> {
@@ -159,7 +162,10 @@ mod tests {
     fn vendor_registry_contains_all_packages() {
         let mut names = PACKAGES.iter().map(|entry| entry.name).collect::<Vec<_>>();
         names.sort_unstable();
-        assert_eq!(names, vec!["bun", "codex", "deno", "gh", "node", "qmd"]);
+        assert_eq!(
+            names,
+            vec!["bun", "codex", "deno", "gh", "node", "qmd", "yoink"]
+        );
     }
 
     #[test]
@@ -170,6 +176,7 @@ mod tests {
         assert_eq!(get("gh").unwrap().executables, ["gh"]);
         assert_eq!(get("node").unwrap().executables, ["node", "npm", "npx"]);
         assert_eq!(get("qmd").unwrap().executables, ["qmd"]);
+        assert_eq!(get("yoink").unwrap().executables, ["yoink"]);
     }
 
     #[test]
@@ -194,6 +201,10 @@ mod tests {
             node::parse_version("v22.18.0").unwrap(),
             Version::parse("22.18.0").unwrap()
         );
+        assert_eq!(
+            yoink::parse_version("v0.6.0").unwrap(),
+            Version::parse("0.6.0").unwrap()
+        );
     }
 
     #[test]
@@ -203,11 +214,13 @@ mod tests {
         let deno = get("deno").unwrap();
         let gh = get("gh").unwrap();
         let node = get("node").unwrap();
+        let yoink = get("yoink").unwrap();
         let bun_version = Version::parse("1.2.3").unwrap();
         let codex_version = Version::parse("0.116.0").unwrap();
         let deno_version = Version::parse("2.7.7").unwrap();
         let gh_version = Version::parse("2.88.1").unwrap();
         let node_version = Version::parse("22.18.0").unwrap();
+        let yoink_version = Version::parse("0.6.0").unwrap();
 
         assert_eq!(
             bun.download_url.unwrap()(&bun_version),
@@ -228,6 +241,10 @@ mod tests {
         assert_eq!(
             node.download_url.unwrap()(&node_version),
             "https://nodejs.org/dist/v22.18.0/node-v22.18.0-darwin-arm64.tar.gz"
+        );
+        assert_eq!(
+            yoink.download_url.unwrap()(&yoink_version),
+            "https://github.com/mxcl/yoink/releases/download/v0.6.0/yoink-0.6.0-Darwin-arm64.tar.gz"
         );
     }
 
@@ -278,6 +295,28 @@ mod tests {
                 assert_eq!(create_dirs, vec!["bin".to_string()]);
             }
             _ => panic!("bun should install from the extracted archive directory"),
+        }
+    }
+
+    #[test]
+    fn yoink_installs_root_binary_from_archive() {
+        let version = Version::parse("0.6.0").unwrap();
+        let strategy = yoink::install(&version);
+        match strategy {
+            InstallStrategy::CopyFile {
+                source,
+                destination_dir,
+                destination_name,
+                mode,
+                create_dirs,
+            } => {
+                assert_eq!(source, "yoink");
+                assert_eq!(destination_dir, "bin");
+                assert_eq!(destination_name, None);
+                assert_eq!(mode, 0o755);
+                assert_eq!(create_dirs, vec!["bin".to_string()]);
+            }
+            _ => panic!("yoink should install a single binary from the archive root"),
         }
     }
 }

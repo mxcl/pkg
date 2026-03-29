@@ -5947,7 +5947,9 @@ fn is_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vendor::{bun, codex, deno, get, gh, github_release_url, node, parse_semver, qmd};
+    use crate::vendor::{
+        bun, codex, deno, get, gh, github_release_url, node, parse_semver, qmd, yoink,
+    };
     use semver::Version;
 
     fn test_db(entries: &[(&str, &str)]) -> Db {
@@ -9286,6 +9288,13 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
             vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "@tobilu/qmd"),
             _ => panic!("qmd should install with npm"),
         }
+
+        match yoink::install(&Version::parse("0.6.0").unwrap()) {
+            vendor::InstallStrategy::CopyFile { source, .. } => {
+                assert_eq!(source, "yoink");
+            }
+            _ => panic!("yoink should install a single binary"),
+        }
     }
 
     #[test]
@@ -9423,6 +9432,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                     br#"{"tag_name":"v0.1.0"}"#.to_vec(),
                 ),
                 (
+                    "/repos/mxcl/yoink/releases/latest".to_string(),
+                    br#"{"tag_name":"v0.6.0"}"#.to_vec(),
+                ),
+                (
                     "/openclaw".to_string(),
                     br#"{"dist-tags":{"latest":"4.5.6"}}"#.to_vec(),
                 ),
@@ -9431,7 +9444,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                     br#"{"info":{"version":"2.9.10"}}"#.to_vec(),
                 ),
             ],
-            8,
+            9,
         );
         let _env = TestEnvGuard::set(&[
             ("PKG_GITHUB_API_ROOT", &base),
@@ -9448,6 +9461,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         assert_eq!(gh::version().unwrap(), Version::parse("2.88.1").unwrap());
         assert_eq!(node::version().unwrap(), Version::parse("22.18.0").unwrap());
         assert_eq!(qmd::version().unwrap(), Version::parse("0.1.0").unwrap());
+        assert_eq!(yoink::version().unwrap(), Version::parse("0.6.0").unwrap());
         assert_eq!(
             resolve_npm_latest_version("openclaw").unwrap(),
             "4.5.6".to_string()
