@@ -102,7 +102,7 @@ const HOMEBREW_NEEDLES: [&[u8]; 6] = [
     b"@@HOMEBREW_JAVA@@",
 ];
 const TMP_X_ROOT: &str = "/tmp/x";
-const TMP_TOOL_ROOT: &str = "/tmp/pkgtool";
+const TMP_TOOL_ROOT: &str = "/tmp/substrate";
 const OPT_PKG_ROOT: &str = "/opt";
 const OPT_NPM_ROOT: &str = "/opt/npm";
 const OPT_PIP_ROOT: &str = "/opt/pip";
@@ -658,8 +658,8 @@ fn prepare_x_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, TempDir), 
     fs::create_dir_all(&plan.tmp_root)
         .map_err(|err| format!("failed to create {}: {err}", plan.tmp_root.display()))?;
     let workspace = Builder::new()
-        .prefix(".")
-        .rand_bytes(6)
+        .prefix("")
+        .rand_bytes(12)
         .tempdir_in(run_root)
         .map_err(|err| {
             format!(
@@ -8621,6 +8621,9 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         assert_eq!(first_plan.stable_root, first_plan.install_root);
         assert!(first_plan.install_root.starts_with(temp.path().join("x")));
         assert_ne!(first_plan.install_root, second_plan.install_root);
+        let workspace_name = first_plan.install_root.file_name().unwrap().to_string_lossy();
+        assert_eq!(workspace_name.len(), 12);
+        assert!(!workspace_name.starts_with('.'));
     }
 
     #[test]
@@ -8653,7 +8656,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         let temp = TempDir::new().unwrap();
         let target_root = temp.path().join("opt");
         let system_tmp_root = temp.path().join("tmp");
-        let shared_tmp_root = temp.path().join("pkgtool");
+        let shared_tmp_root = temp.path().join("substrate");
 
         assert_eq!(
             temp_root_for_target_root(&target_root, &system_tmp_root, &shared_tmp_root),
@@ -8666,7 +8669,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         let temp = TempDir::new().unwrap();
         let target_root = temp.path().join("opt");
         let system_tmp_root = temp.path().join("tmp");
-        let shared_tmp_root = temp.path().join("pkgtool");
+        let shared_tmp_root = temp.path().join("substrate");
         fs::create_dir_all(&shared_tmp_root).unwrap();
         let mut permissions = fs::metadata(&shared_tmp_root).unwrap().permissions();
         permissions.set_mode(0o555);
@@ -8683,7 +8686,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         let temp = TempDir::new().unwrap();
         let target_root = PathBuf::from("relative/opt");
         let system_tmp_root = temp.path().join("tmp");
-        let shared_tmp_root = temp.path().join("pkgtool");
+        let shared_tmp_root = temp.path().join("substrate");
 
         assert_eq!(
             temp_root_for_target_root(&target_root, &system_tmp_root, &shared_tmp_root),
