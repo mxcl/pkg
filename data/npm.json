@@ -1,5 +1,5 @@
 {
-  qmd: {
-    homebrewDeps: ["sqlite"],
-  },
+  "qmd": {
+    "homebrewDeps": ["sqlite"]
+  }
 }

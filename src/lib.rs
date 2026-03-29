@@ -2098,7 +2098,8 @@ fn parse_python_formula_version(formula: &str) -> Option<(u64, u64)> {
 
 fn embedded_npm_package_data() -> &'static HashMap<String, PackageInstallData> {
     NPM_PACKAGE_DATA.get_or_init(|| {
-        json5::from_str(EMBEDDED_NPM_DATA).expect("failed to parse embedded npm package data")
+        serde_json::from_str(EMBEDDED_NPM_DATA)
+            .expect("failed to parse embedded npm package data")
     })
 }
 
