@@ -169,8 +169,6 @@ struct FormulaInfo {
     #[serde(default)]
     license: Option<String>,
     #[serde(default)]
-    caveats: String,
-    #[serde(default)]
     versions: FormulaVersions,
     #[serde(default)]
     revision: u32,
@@ -408,6 +406,8 @@ struct PackageInfo {
     installed_version: Option<String>,
     latest_version: Option<String>,
     latest_version_error: Option<String>,
+    executable_paths: Vec<String>,
+    executable_paths_error: Option<String>,
     homebrew_info: Option<HomebrewPackageInfo>,
     homebrew_info_error: Option<String>,
 }
@@ -419,7 +419,6 @@ struct HomebrewPackageInfo {
     homepage: Option<String>,
     license: Option<String>,
     dependencies: Vec<String>,
-    caveats: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2657,6 +2656,8 @@ fn resolve_installed_package_info(
         installed_version: None,
         latest_version: None,
         latest_version_error: None,
+        executable_paths: Vec::new(),
+        executable_paths_error: None,
         homebrew_info: None,
         homebrew_info_error: None,
     };
@@ -2673,6 +2674,10 @@ fn resolve_installed_package_info(
 
     if info.source.is_none() {
         info.source = explicit_requested_package_source(requested);
+    }
+    match installed_stub_paths_at(&info.install_root) {
+        Ok(paths) => info.executable_paths = paths,
+        Err(err) => info.executable_paths_error = Some(err),
     }
     populate_package_info_identity(&mut info);
     populate_package_info_metadata(config, &mut info);
@@ -2697,6 +2702,8 @@ fn resolve_uninstalled_package_info(
         installed_version: None,
         latest_version: None,
         latest_version_error: None,
+        executable_paths: Vec::new(),
+        executable_paths_error: None,
         homebrew_info: None,
         homebrew_info_error: None,
     };
@@ -2872,7 +2879,6 @@ fn homebrew_package_info_from_formula_info(
             .clone()
             .and_then(|value| string_or_none(&value)),
         dependencies: info.dependencies.clone(),
-        caveats: string_or_none(&info.caveats),
     }
 }
 
@@ -2885,129 +2891,293 @@ fn string_or_none(value: &str) -> Option<String> {
     }
 }
 
-fn format_package_info(info: &PackageInfo) -> String {
-    let mut lines = vec![
-        format!("package: {}", info.qualified_name),
-        format!("install_root: {}", info.install_root.display()),
-        format!("installed: {}", yes_no(info.installed)),
-        format!(
-            "aliases: {}",
-            format_aliases(&info.aliases, info.aliases_error.as_deref())
-        ),
-        format!(
-            "installed_version: {}",
-            format_optional_field(info.installed_version.as_deref(), None)
-        ),
-        format!(
-            "source: {}",
-            format_source_field(info.source.as_ref(), info.source_error.as_deref())
-        ),
-        format!(
-            "latest_version: {}",
-            format_optional_field(
-                info.latest_version.as_deref(),
-                info.latest_version_error.as_deref()
-            )
-        ),
-        format!("outdated: {}", format_outdated_field(info)),
-    ];
+const INFO_WIDTH: usize = 64;
+const INFO_INNER_WIDTH: usize = INFO_WIDTH - 2;
+const INFO_LABEL_WIDTH: usize = 14;
 
-    append_homebrew_info_lines(&mut lines, info);
+fn format_package_info(info: &PackageInfo) -> String {
+    let installed_value = if info.installed {
+        info.install_root.display().to_string()
+    } else {
+        "no".to_string()
+    };
+    let mut lines = vec![plain_box_top()];
+    for (index, line) in wrap_text(&info.qualified_name, INFO_WIDTH - 6)
+        .into_iter()
+        .enumerate()
+    {
+        if index == 0 {
+            lines.push(format!("   📦 {line}"));
+        } else {
+            lines.push(format!("     {line}"));
+        }
+    }
+    lines.push(plain_box_bottom());
     lines.push(String::new());
+
+    push_single_line_field(
+        &mut lines,
+        "Version",
+        &format_version_value(info),
+        format_version_status(info).as_deref(),
+    );
+    push_single_line_field(&mut lines, "Installed", &installed_value, None);
+    push_wrapped_field(
+        &mut lines,
+        "Source",
+        &format_source_field(info.source.as_ref()),
+    );
+    if !info.aliases.is_empty() {
+        push_wrapped_field(&mut lines, "Aliases", &info.aliases.join(", "));
+    }
+
+    let mut metadata_lines = Vec::new();
+    if let Some(homebrew_info) = info.homebrew_info.as_ref() {
+        if let Some(description) = homebrew_info.description.as_deref() {
+            push_wrapped_field(&mut metadata_lines, "Description", description);
+        }
+        if let Some(homepage) = homebrew_info.homepage.as_deref() {
+            push_wrapped_field(&mut metadata_lines, "Homepage", homepage);
+        }
+        if let Some(license) = homebrew_info.license.as_deref() {
+            push_wrapped_field(&mut metadata_lines, "License", license);
+        }
+        push_wrapped_field(
+            &mut metadata_lines,
+            "Formula Page",
+            &homebrew_formula_page_url(&homebrew_info.formula),
+        );
+    } else if let Some(PackageReceiptSource::Formula { root_formula }) = info.source.as_ref() {
+        push_wrapped_field(
+            &mut metadata_lines,
+            "Formula Page",
+            &homebrew_formula_page_url(root_formula),
+        );
+        if let Some(err) = info.homebrew_info_error.as_deref() {
+            push_wrapped_field(
+                &mut metadata_lines,
+                "Homebrew Info",
+                &format!("unavailable ({err})"),
+            );
+        }
+    }
+
+    if !metadata_lines.is_empty() {
+        lines.push(String::new());
+        lines.extend(metadata_lines);
+    }
+
+    if let Some(homebrew_info) = info.homebrew_info.as_ref() {
+        if !homebrew_info.dependencies.is_empty() {
+            lines.push(String::new());
+            lines.push(section_top("Dependencies"));
+            for line in wrap_tokens(&homebrew_info.dependencies, 2, 3) {
+                lines.push(line);
+            }
+            lines.push(section_bottom());
+        }
+    }
+
+    if !info.executable_paths.is_empty() || info.executable_paths_error.is_some() {
+        lines.push(String::new());
+        lines.push(section_top("Executables"));
+        if let Some(err) = info.executable_paths_error.as_deref() {
+            for line in wrap_text(&format!("unavailable ({err})"), INFO_INNER_WIDTH - 2) {
+                lines.push(format!("  {line}"));
+            }
+        } else {
+            for executable in &info.executable_paths {
+                for line in wrap_text(executable, INFO_INNER_WIDTH - 2) {
+                    lines.push(format!("  {line}"));
+                }
+            }
+        }
+        lines.push(section_bottom());
+    }
+
     lines.join("\n")
 }
 
-fn append_homebrew_info_lines(lines: &mut Vec<String>, info: &PackageInfo) {
-    let Some(homebrew_info) = info.homebrew_info.as_ref() else {
-        if let Some(err) = info.homebrew_info_error.as_deref() {
-            lines.push(format!("homebrew_metadata: unavailable ({err})"));
-        }
-        return;
-    };
+fn plain_box_top() -> String {
+    format!("╭{}╮", "─".repeat(INFO_INNER_WIDTH))
+}
 
-    lines.push(format!("homebrew_formula: {}", homebrew_info.formula));
-    lines.push(format!(
-        "description: {}",
-        format_optional_field(homebrew_info.description.as_deref(), None)
-    ));
-    lines.push(format!(
-        "homepage: {}",
-        format_optional_field(homebrew_info.homepage.as_deref(), None)
-    ));
-    lines.push(format!(
-        "license: {}",
-        format_optional_field(homebrew_info.license.as_deref(), None)
-    ));
-    lines.push(format!(
-        "dependencies: {}",
-        format_dependencies(&homebrew_info.dependencies)
-    ));
-    match homebrew_info.caveats.as_deref() {
-        Some(caveats) => {
-            lines.push("caveats:".to_string());
-            for line in caveats.lines() {
-                lines.push(format!("  {}", line));
+fn plain_box_bottom() -> String {
+    format!("╰{}╯", "─".repeat(INFO_INNER_WIDTH))
+}
+
+fn section_top(title: &str) -> String {
+    let prefix = format!("╭─ {title} ");
+    let fill = "─".repeat(INFO_WIDTH - prefix.chars().count() - 1);
+    format!("{prefix}{fill}╮")
+}
+
+fn section_bottom() -> String {
+    format!("╰{}╯", "─".repeat(INFO_INNER_WIDTH))
+}
+
+fn push_single_line_field(lines: &mut Vec<String>, label: &str, value: &str, suffix: Option<&str>) {
+    let mut line = format!("  {label:<INFO_LABEL_WIDTH$}{value}");
+    if let Some(suffix) = suffix {
+        line.push_str("  ");
+        line.push_str(suffix);
+    }
+    lines.push(line);
+}
+
+fn push_wrapped_field(lines: &mut Vec<String>, label: &str, value: &str) {
+    let wrapped = wrap_text(value, INFO_WIDTH - 2 - INFO_LABEL_WIDTH - 2);
+    let mut iter = wrapped.into_iter();
+    if let Some(first) = iter.next() {
+        lines.push(format!("  {label:<INFO_LABEL_WIDTH$}{first}"));
+        for line in iter {
+            lines.push(format!("  {:<INFO_LABEL_WIDTH$}{line}", ""));
+        }
+    } else {
+        lines.push(format!("  {label:<INFO_LABEL_WIDTH$}"));
+    }
+}
+
+fn wrap_text(value: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for paragraph in value.lines() {
+        if paragraph.is_empty() {
+            if lines.is_empty() || !lines.last().unwrap().is_empty() {
+                lines.push(String::new());
+            }
+            continue;
+        }
+        let mut current = String::new();
+        for word in paragraph.split_whitespace() {
+            let chunks = split_text_hard(word, width);
+            for chunk in chunks {
+                let next_len = if current.is_empty() {
+                    chunk.chars().count()
+                } else {
+                    current.chars().count() + 1 + chunk.chars().count()
+                };
+                if !current.is_empty() && next_len > width {
+                    lines.push(current);
+                    current = chunk;
+                } else {
+                    if !current.is_empty() {
+                        current.push(' ');
+                    }
+                    current.push_str(&chunk);
+                }
             }
         }
-        None => lines.push("caveats: none".to_string()),
+        if !current.is_empty() {
+            lines.push(current);
+        }
     }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
-fn format_source_field(source: Option<&PackageReceiptSource>, err: Option<&str>) -> String {
+fn split_text_hard(value: &str, width: usize) -> Vec<String> {
+    if value.chars().count() <= width {
+        return vec![value.to_string()];
+    }
+
+    let mut chunks = Vec::new();
+    let mut current = String::new();
+    for ch in value.chars() {
+        if current.chars().count() == width {
+            chunks.push(current);
+            current = String::new();
+        }
+        current.push(ch);
+    }
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+fn wrap_tokens(tokens: &[String], indent: usize, gap: usize) -> Vec<String> {
+    let indent_str = " ".repeat(indent);
+    let gap_str = " ".repeat(gap);
+    let mut lines = Vec::new();
+    let mut current = indent_str.clone();
+    for token in tokens {
+        let candidate = if current.trim().is_empty() {
+            format!("{indent_str}{token}")
+        } else {
+            format!("{current}{gap_str}{token}")
+        };
+        if current != indent_str && candidate.chars().count() > INFO_WIDTH {
+            lines.push(current);
+            current = format!("{indent_str}{token}");
+        } else if current == indent_str {
+            current.push_str(token);
+        } else {
+            current.push_str(&gap_str);
+            current.push_str(token);
+        }
+    }
+    if current != indent_str {
+        lines.push(current);
+    }
+    lines
+}
+
+fn format_source_field(source: Option<&PackageReceiptSource>) -> String {
     match source {
-        Some(PackageReceiptSource::Formula { root_formula }) => {
-            format!("homebrew formula {root_formula}")
-        }
-        Some(PackageReceiptSource::Vendor { vendor_name }) => {
-            format!("vendor package {vendor_name}")
-        }
-        Some(PackageReceiptSource::Npm { package_name }) => format!("npm package {package_name}"),
-        Some(PackageReceiptSource::Pip { package_name }) => format!("pip package {package_name}"),
-        None => format_optional_field(None, err),
+        Some(PackageReceiptSource::Formula { .. }) => "Homebrew".to_string(),
+        Some(PackageReceiptSource::Vendor { .. }) => "Subs".to_string(),
+        Some(PackageReceiptSource::Npm { .. }) => "npm".to_string(),
+        Some(PackageReceiptSource::Pip { .. }) => "PyPI".to_string(),
+        None => "Unknown".to_string(),
     }
 }
 
-fn format_outdated_field(info: &PackageInfo) -> &'static str {
+fn format_version_value(info: &PackageInfo) -> String {
+    if let Some(installed_version) = info.installed_version.as_deref() {
+        installed_version.to_string()
+    } else if let Some(latest_version) = info.latest_version.as_deref() {
+        latest_version.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn format_version_status(info: &PackageInfo) -> Option<String> {
     if !info.installed {
-        return "n/a";
+        return None;
     }
-
     match (&info.installed_version, &info.latest_version) {
-        (Some(installed_version), Some(latest_version)) => {
-            yes_no(installed_version != latest_version)
+        (Some(installed_version), Some(latest_version)) if installed_version == latest_version => {
+            Some("✔ up to date".to_string())
         }
-        _ => "unknown",
+        (Some(_), Some(latest_version)) => Some(format!("update available ({latest_version})")),
+        (_, Some(_)) => None,
+        (_, None) => info
+            .latest_version_error
+            .as_ref()
+            .map(|err| format!("latest unknown ({err})")),
     }
 }
 
-fn format_optional_field(value: Option<&str>, err: Option<&str>) -> String {
-    match (value, err) {
-        (Some(value), _) => value.to_string(),
-        (None, Some(err)) => format!("unknown ({err})"),
-        (None, None) => "unknown".to_string(),
-    }
+fn homebrew_formula_page_url(formula: &str) -> String {
+    format!("https://formulae.brew.sh/formula/{formula}")
 }
 
-fn format_dependencies(dependencies: &[String]) -> String {
-    if dependencies.is_empty() {
-        "none".to_string()
-    } else {
-        dependencies.join(", ")
-    }
-}
-
-fn format_aliases(aliases: &[String], err: Option<&str>) -> String {
-    if !aliases.is_empty() {
-        aliases.join(", ")
-    } else if let Some(err) = err {
-        format!("unknown ({err})")
-    } else {
-        "none".to_string()
-    }
-}
-
-fn yes_no(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+fn installed_stub_paths_at(install_root: &Path) -> Result<Vec<String>, String> {
+    let mut paths = load_stub_manifest(&install_root.join(STUB_MANIFEST))?
+        .stubs
+        .into_iter()
+        .map(|stub| {
+            PathBuf::from(USR_LOCAL_BIN)
+                .join(stub)
+                .display()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    Ok(paths)
 }
 
 #[cfg(not(feature = "gold-release"))]
@@ -6703,7 +6873,6 @@ mod tests {
             desc: String::new(),
             homepage: String::new(),
             license: None,
-            caveats: String::new(),
             versions: FormulaVersions::default(),
             revision: 0,
             dependencies: Vec::new(),
@@ -7412,37 +7581,35 @@ or `npm:clawhub` for the aliased package"
             installed_version: Some("7.1".to_string()),
             latest_version: Some("7.2".to_string()),
             latest_version_error: None,
+            executable_paths: vec![
+                "/usr/local/bin/ffmpeg".to_string(),
+                "/usr/local/bin/ffprobe".to_string(),
+            ],
+            executable_paths_error: None,
             homebrew_info: Some(HomebrewPackageInfo {
                 formula: "ffmpeg".to_string(),
                 description: Some("Play, record, convert, and stream audio and video".to_string()),
                 homepage: Some("https://ffmpeg.org/".to_string()),
                 license: Some("GPL-2.0-or-later".to_string()),
                 dependencies: vec!["aom".to_string(), "x264".to_string()],
-                caveats: Some("Enable foo\nThen restart bar".to_string()),
             }),
             homebrew_info_error: None,
         };
 
-        assert_eq!(
-            format_package_info(&info),
-            concat!(
-                "package: brew:ffmpeg\n",
-                "install_root: /opt/ffmpeg\n",
-                "installed: yes\n",
-                "aliases: ffmpeg4\n",
-                "installed_version: 7.1\n",
-                "source: homebrew formula ffmpeg\n",
-                "latest_version: 7.2\n",
-                "outdated: yes\n",
-                "homebrew_formula: ffmpeg\n",
-                "description: Play, record, convert, and stream audio and video\n",
-                "homepage: https://ffmpeg.org/\n",
-                "license: GPL-2.0-or-later\n",
-                "dependencies: aom, x264\n",
-                "caveats:\n",
-                "  Enable foo\n",
-                "  Then restart bar\n",
-            )
+        let rendered = format_package_info(&info);
+        assert!(rendered.contains("📦 brew:ffmpeg"));
+        assert!(rendered.contains("Aliases       ffmpeg4"));
+        assert!(rendered.contains("Source        Homebrew"));
+        assert!(rendered.contains("Formula Page  https://formulae.brew.sh/formula/ffmpeg"));
+        assert!(rendered.contains("╭─ Dependencies "));
+        assert!(rendered.contains("aom   x264"));
+        assert!(rendered.contains("╭─ Executables "));
+        assert!(rendered.contains("/usr/local/bin/ffmpeg"));
+        assert!(rendered.contains("/usr/local/bin/ffprobe"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() <= INFO_WIDTH)
         );
     }
 
@@ -7462,21 +7629,22 @@ or `npm:clawhub` for the aliased package"
             installed_version: None,
             latest_version: None,
             latest_version_error: Some("failed to fetch formula metadata".to_string()),
+            executable_paths: Vec::new(),
+            executable_paths_error: None,
             homebrew_info: None,
             homebrew_info_error: Some("failed to fetch formula metadata".to_string()),
         };
 
-        assert_eq!(
-            format_package_info(&info),
-            "package: brew:foo\n\
-install_root: /opt/foo\n\
-installed: no\n\
-aliases: unknown (failed to fetch Homebrew formula index)\n\
-installed_version: unknown\n\
-source: homebrew formula foo\n\
-latest_version: unknown (failed to fetch formula metadata)\n\
-outdated: n/a\n\
-homebrew_metadata: unavailable (failed to fetch formula metadata)\n"
+        let rendered = format_package_info(&info);
+        assert!(rendered.contains("📦 brew:foo"));
+        assert!(rendered.contains("Installed     no"));
+        assert!(rendered.contains("Source        Homebrew"));
+        assert!(rendered.contains("Formula Page  https://formulae.brew.sh/formula/foo"));
+        assert!(rendered.contains("Homebrew Info unavailable (failed to fetch formula metadata)"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() <= INFO_WIDTH)
         );
     }
 
@@ -7496,20 +7664,22 @@ homebrew_metadata: unavailable (failed to fetch formula metadata)\n"
             installed_version: None,
             latest_version: Some("2.7.9".to_string()),
             latest_version_error: None,
+            executable_paths: Vec::new(),
+            executable_paths_error: None,
             homebrew_info: None,
             homebrew_info_error: None,
         };
 
-        assert_eq!(
-            format_package_info(&info),
-            "package: subs:deno\n\
-install_root: /opt/deno\n\
-installed: no\n\
-aliases: none\n\
-installed_version: unknown\n\
-source: vendor package deno\n\
-latest_version: 2.7.9\n\
-outdated: n/a\n"
+        let rendered = format_package_info(&info);
+        assert!(rendered.contains("📦 subs:deno"));
+        assert!(rendered.contains("Version       2.7.9"));
+        assert!(rendered.contains("Installed     no"));
+        assert!(rendered.contains("Source        Subs"));
+        assert!(!rendered.contains("Aliases"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() <= INFO_WIDTH)
         );
     }
 
