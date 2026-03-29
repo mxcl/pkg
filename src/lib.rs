@@ -6621,9 +6621,7 @@ fn is_root() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vendor::{
-        bun, codex, deno, get, gh, github_release_url, node, parse_semver, qmd, yoink,
-    };
+    use crate::vendor::{bun, codex, deno, get, gh, github_release_url, node, parse_semver, yoink};
     use semver::Version;
 
     fn test_db(entries: &[(&str, &str)]) -> Db {
@@ -6980,7 +6978,7 @@ or `npm:clawhub` for the aliased package"
     }
 
     #[test]
-    fn parse_i_request_prefers_vendor_packages_over_aliases() {
+    fn parse_i_request_accepts_alias_when_no_vendor_package_exists() {
         let invocation = Invocation::for_subcommand("subs", "i", Mode::I);
         let request =
             parse_i_request_from_iter(&invocation, vec![OsString::from("qmd")].into_iter())
@@ -6989,7 +6987,10 @@ or `npm:clawhub` for the aliased package"
         assert_eq!(
             request,
             Some(IRequest {
-                packages: vec![RequestedPackage::Auto("qmd".to_string())],
+                packages: vec![RequestedPackage::Alias {
+                    alias: "qmd".to_string(),
+                    target: PackageAliasTarget::NpmPackage("@tobilu/qmd".to_string()),
+                }],
                 force: false,
             })
         );
@@ -7169,7 +7170,7 @@ or `npm:clawhub` for the aliased package"
     }
 
     #[test]
-    fn parse_uninstall_request_prefers_vendor_packages_over_aliases() {
+    fn parse_uninstall_request_resolves_alias_when_no_vendor_package_exists() {
         let invocation = Invocation {
             binary_name: "subs".to_string(),
             name: "subs rm".to_string(),
@@ -7182,7 +7183,7 @@ or `npm:clawhub` for the aliased package"
         assert_eq!(
             request,
             Some(UninstallRequest {
-                packages: vec!["qmd".to_string()],
+                packages: vec!["npm:@tobilu/qmd".to_string()],
             })
         );
     }
@@ -8359,10 +8360,10 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
     #[test]
     fn partition_dependency_names_recurses_through_vendor_dependencies() {
-        let (formulas, vendors) = partition_dependency_names(&["qmd"]).unwrap();
+        let (formulas, vendors) = partition_dependency_names(&["codex"]).unwrap();
 
-        assert!(formulas.is_empty());
-        assert_eq!(vendors, vec!["node".to_string(), "qmd".to_string()]);
+        assert_eq!(formulas, vec!["ripgrep".to_string()]);
+        assert_eq!(vendors, vec!["codex".to_string()]);
     }
 
     #[test]
@@ -8407,7 +8408,14 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     #[test]
     fn append_vendor_npm_homebrew_dependencies_uses_vendor_install_strategy() {
         let qmd = VendorInstall {
-            package: vendor::get("qmd").unwrap(),
+            package: vendor::VendorPackage {
+                name: "qmd",
+                dependencies: &[],
+                executables: &["qmd"],
+                version: fake_vendor_version,
+                download_url: None,
+                install: fake_qmd_install_strategy,
+            },
             version: Version::parse("1.2.3").unwrap(),
         };
         let mut formulas = Vec::new();
@@ -9097,15 +9105,15 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         let temp = TempDir::new().unwrap();
         let plan = InstallPlan {
             mode: Mode::I,
-            package_name: "qmd".to_string(),
-            root_formula: "qmd".to_string(),
-            stable_root: temp.path().join("qmd"),
-            install_root: temp.path().join("qmd"),
+            package_name: "demo".to_string(),
+            root_formula: "demo".to_string(),
+            stable_root: temp.path().join("demo"),
+            install_root: temp.path().join("demo"),
             tmp_root: temp.path().join("tmp"),
         };
         fs::create_dir_all(&plan.tmp_root).unwrap();
         fs::create_dir_all(plan.install_root.join("bin")).unwrap();
-        fs::write(plan.install_root.join("bin/qmd"), b"#!/bin/sh\n").unwrap();
+        fs::write(plan.install_root.join("bin/demo"), b"#!/bin/sh\n").unwrap();
 
         let sqlite_archive = temp.path().join("sqlite.tar.gz");
         write_test_bottle_archive(
@@ -9139,7 +9147,7 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert!(plan.install_root.join("bin/sqlite3").is_file());
         assert!(plan.receipt_path("sqlite").is_file());
-        assert!(!plan.install_root.join("bin/qmd").exists());
+        assert!(!plan.install_root.join("bin/demo").exists());
     }
 
     #[test]
@@ -10269,11 +10277,6 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
             _ => panic!("node should install a tree"),
         }
 
-        match qmd::install(&Version::parse("1.2.3").unwrap()) {
-            vendor::InstallStrategy::NpmGlobal { package } => assert_eq!(package, "@tobilu/qmd"),
-            _ => panic!("qmd should install with npm"),
-        }
-
         match yoink::install(&Version::parse("0.6.0").unwrap()) {
             vendor::InstallStrategy::CopyFile { source, .. } => {
                 assert_eq!(source, "yoink");
@@ -10413,10 +10416,6 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                     br#"{"tag_name":"v22.18.0"}"#.to_vec(),
                 ),
                 (
-                    "/repos/tobi/qmd/releases/latest".to_string(),
-                    br#"{"tag_name":"v0.1.0"}"#.to_vec(),
-                ),
-                (
                     "/repos/mxcl/yoink/releases/latest".to_string(),
                     br#"{"tag_name":"v0.6.0"}"#.to_vec(),
                 ),
@@ -10429,7 +10428,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                     br#"{"info":{"version":"2.9.10"}}"#.to_vec(),
                 ),
             ],
-            9,
+            8,
         );
         let _env = TestEnvGuard::set(&[
             ("PKG_GITHUB_API_ROOT", &base),
@@ -10445,7 +10444,6 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         assert_eq!(deno::version().unwrap(), Version::parse("2.7.7").unwrap());
         assert_eq!(gh::version().unwrap(), Version::parse("2.88.1").unwrap());
         assert_eq!(node::version().unwrap(), Version::parse("22.18.0").unwrap());
-        assert_eq!(qmd::version().unwrap(), Version::parse("0.1.0").unwrap());
         assert_eq!(yoink::version().unwrap(), Version::parse("0.6.0").unwrap());
         assert_eq!(
             resolve_npm_latest_version("openclaw").unwrap(),
@@ -10696,6 +10694,12 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
     fn fake_vendor_install_strategy(_version: &semver::Version) -> vendor::InstallStrategy {
         vendor::InstallStrategy::CopyTree {
             source: "ignored".to_string(),
+        }
+    }
+
+    fn fake_qmd_install_strategy(_version: &semver::Version) -> vendor::InstallStrategy {
+        vendor::InstallStrategy::NpmGlobal {
+            package: "@tobilu/qmd".to_string(),
         }
     }
 

@@ -131,8 +131,6 @@ pub mod deno;
 pub mod gh;
 #[path = "../vendor/node.rs"]
 pub mod node;
-#[path = "../vendor/qmd.rs"]
-pub mod qmd;
 #[path = "../vendor/yoink.rs"]
 pub mod yoink;
 
@@ -142,7 +140,6 @@ pub static PACKAGES: &[&VendorEntry] = &[
     &deno::ENTRY,
     &gh::ENTRY,
     &node::ENTRY,
-    &qmd::ENTRY,
     &yoink::ENTRY,
 ];
 
@@ -162,10 +159,7 @@ mod tests {
     fn vendor_registry_contains_all_packages() {
         let mut names = PACKAGES.iter().map(|entry| entry.name).collect::<Vec<_>>();
         names.sort_unstable();
-        assert_eq!(
-            names,
-            vec!["bun", "codex", "deno", "gh", "node", "qmd", "yoink"]
-        );
+        assert_eq!(names, vec!["bun", "codex", "deno", "gh", "node", "yoink"]);
     }
 
     #[test]
@@ -175,7 +169,6 @@ mod tests {
         assert_eq!(get("deno").unwrap().executables, ["deno"]);
         assert_eq!(get("gh").unwrap().executables, ["gh"]);
         assert_eq!(get("node").unwrap().executables, ["node", "npm", "npx"]);
-        assert_eq!(get("qmd").unwrap().executables, ["qmd"]);
         assert_eq!(get("yoink").unwrap().executables, ["yoink"]);
     }
 
@@ -251,7 +244,6 @@ mod tests {
     #[test]
     fn vendor_packages_expose_dependencies() {
         assert_eq!(get("codex").unwrap().dependencies, ["ripgrep"]);
-        assert_eq!(get("qmd").unwrap().dependencies, ["node"]);
     }
 
     #[test]
