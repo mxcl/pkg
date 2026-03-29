@@ -8,8 +8,8 @@ autobins = false
 gold-release = []
 
 [[bin]]
-name = "ss"
-path = "src/bin/ss.rs"
+name = "subs"
+path = "src/bin/subs.rs"
 
 [dependencies]
 flate2 = "1"

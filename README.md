@@ -32,27 +32,27 @@ sh <(curl -fsSL https://yoink.sh) --stream mxcl/substrate | sudo tar -xzC /usr/l
 - Dependencies of Homebrew packages are installed alongside, ie. a self
   contained sandbox
 - Installs as little as possible to `/usr/local/bin` (no deps)
-- `ss run PKG` can run anything ephemerally (downloads fresh every time)
+- `subs run PKG` can run anything ephemerally (downloads fresh every time)
 - Agent focused, eg. we package `qmd` and support npm installs like
   `npm:openclaw`
 
 ## Usage
 
 ```sh
-$ ss run zopflipng in.png out.png  # alias: x
+$ subs run zopflipng in.png out.png  # alias: x
 ## ^^ emphermeral; downloads fresh every time
 
-$ sudo ss install npm:openclaw
+$ sudo subs install npm:openclaw
 /usr/local/bin/openclaw
 # ^^ humans don’t let Claws modify themselves
 
-$ sudo ss uninstall npm:openclaw  # alias: rm
+$ sudo subs uninstall npm:openclaw  # alias: rm
 
-$ ss list  # alias: ls
+$ subs list  # alias: ls
 
-$ ss outdated
+$ subs outdated
 
-$ sudo ss update  # alias: up
+$ sudo subs update  # alias: up
 ```
 
 ## Is This Ready For Me?
@@ -67,13 +67,13 @@ that?
 
 ## Caveats
 
-- `ss run` is ephemeral. It always downloads and it always downloads the
-  latest version unless you specify, eg. `ss run zopflipng@1.0.3 …`
+- `subs run` is ephemeral. It always downloads and it always downloads the
+  latest version unless you specify, eg. `subs run zopflipng@1.0.3 …`
   > This is a feature. We are operating in an agentic world where agents
   > can literally modify binaries if they want to be malicious. Everything
   > must be installed by a human and if not then the tool that is installed
   > by root that is executing things should never trust a user-writable cache
-- there is no `ss services` command. Use `brew`.
+- there is no `subs services` command. Use `brew`.
 - some Homebrew formulae are not supported. If you come across them, report
   this as a bug.
 - We do not and will likely never support casks.
@@ -86,7 +86,7 @@ that?
   entities that are not even human. Best we secure things better now.
 - However, I want agents to be able to run anythiing they need without it
   messing with the rest of the system.
-- Hence `ss run` executes in a sandbox that can only be configured by the
+- Hence `subs run` executes in a sandbox that can only be configured by the
   root user. If you run it without configuring it first it can only write to
   `/tmp`
 - I trust Vendors *the most* to maintain their own packages.
@@ -99,6 +99,6 @@ that?
 - For Homebrew packages we rewrite `/opt/homebrew/` in the binaries and any
   text files.
   - Indeed this may prove stupid and/or flakey
-  - Indeed we do not recommend you depend on `ss` in any substantial way
+  - Indeed we do not recommend you depend on `subs` in any substantial way
 - We are overzealously rejecting any Homebrew packages with pre or post
   install steps at this time.
