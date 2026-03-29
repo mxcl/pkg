@@ -569,7 +569,7 @@ impl InstallPlan {
 
     fn for_i_npm(package_name: String, root_formula: String, npm_package: &str) -> Self {
         let npm_root = PathBuf::from(OPT_NPM_ROOT);
-        let stable_root = npm_root.join(npm_package_install_leaf_name(npm_package));
+        let stable_root = npm_root.join(npm_package_install_relative_path(npm_package));
         let install_root = stable_root.clone();
         Self {
             mode: Mode::I,
@@ -2043,6 +2043,15 @@ fn npm_package_display_name(package: &str) -> String {
     format!("npm:{package}")
 }
 
+fn npm_package_install_relative_path(package: &str) -> PathBuf {
+    if let Some(scoped) = package.strip_prefix('@') {
+        if let Some((scope, name)) = scoped.split_once('/') {
+            return PathBuf::from(format!("@{scope}")).join(name);
+        }
+    }
+    PathBuf::from(package)
+}
+
 fn npm_package_install_leaf_name(package: &str) -> String {
     package.rsplit('/').next().unwrap_or(package).to_string()
 }
@@ -2162,7 +2171,7 @@ fn package_install_root(opt_root: &Path, package_name: &str) -> Result<PathBuf, 
         validate_npm_package_name(npm_package)?;
         return Ok(opt_root
             .join("npm")
-            .join(npm_package_install_leaf_name(npm_package)));
+            .join(npm_package_install_relative_path(npm_package)));
     }
     if let Some(pip_package) = package_name.strip_prefix("pip:") {
         validate_pip_package_name(pip_package)?;
@@ -3196,6 +3205,31 @@ fn installed_npm_package_refs(npm_root: &Path) -> Result<Vec<InstalledPackageRef
             .into_string()
             .map_err(|_| format!("non-utf8 directory name under {}", npm_root.display()))?;
         if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        if name.starts_with('@') {
+            let scope_entries = fs::read_dir(&path)
+                .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+            for scope_entry in scope_entries {
+                let scope_entry = scope_entry
+                    .map_err(|err| format!("failed to read {}: {err}", path.display()))?;
+                let scoped_path = scope_entry.path();
+                let scoped_name = scope_entry
+                    .file_name()
+                    .into_string()
+                    .map_err(|_| format!("non-utf8 directory name under {}", path.display()))?;
+                if scoped_name.starts_with('.') || !scoped_path.is_dir() {
+                    continue;
+                }
+                let package = format!("{name}/{scoped_name}");
+                packages.push(InstalledPackageRef {
+                    package_name: match load_package_receipt(&scoped_path.join(ROOT_RECEIPT)) {
+                        Ok(Some(receipt)) => receipt.package_name,
+                        Ok(None) | Err(_) => npm_package_display_name(&package),
+                    },
+                    install_root: scoped_path,
+                });
+            }
             continue;
         }
         packages.push(InstalledPackageRef {
@@ -4247,11 +4281,30 @@ fn remove_existing_package_install(
         Ok(_) => {
             remove_package_stubs_from_bin(opt_root, package_name, bin_dir)?;
             remove_path(&install_root)?;
+            if package_name.starts_with("npm:@") {
+                remove_empty_parent_dirs(&install_root, &opt_root.join("npm"))?;
+            }
             refresh_post_uninstall_stubs(opt_root, bin_dir)
         }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(err) => Err(format!("failed to stat {}: {err}", install_root.display())),
     }
+}
+
+fn remove_empty_parent_dirs(path: &Path, stop_at: &Path) -> Result<(), String> {
+    let mut current = path.parent();
+    while let Some(dir) = current {
+        if dir == stop_at {
+            break;
+        }
+        match fs::remove_dir(dir) {
+            Ok(()) => current = dir.parent(),
+            Err(err) if err.kind() == std::io::ErrorKind::DirectoryNotEmpty => break,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => current = dir.parent(),
+            Err(err) => return Err(format!("failed to remove {}: {err}", dir.display())),
+        }
+    }
+    Ok(())
 }
 
 fn collect_shared_stubs(
@@ -7540,6 +7593,7 @@ outdated: n/a\n"
         let temp = TempDir::new().unwrap();
         fs::create_dir_all(temp.path().join("deno")).unwrap();
         fs::create_dir_all(temp.path().join("npm/openclaw")).unwrap();
+        fs::create_dir_all(temp.path().join("npm/@tobilu/qmd")).unwrap();
         fs::create_dir_all(temp.path().join("pip/psycopg2")).unwrap();
         fs::create_dir_all(temp.path().join(".tmp")).unwrap();
         fs::write(temp.path().join("README"), b"not a package").unwrap();
@@ -7550,6 +7604,17 @@ outdated: n/a\n"
                 version: "1.2.3".to_string(),
                 source: PackageReceiptSource::Npm {
                     package_name: "openclaw".to_string(),
+                },
+            },
+        )
+        .unwrap();
+        write_package_receipt(
+            &temp.path().join("npm/@tobilu/qmd").join(ROOT_RECEIPT),
+            &PackageReceipt {
+                package_name: "npm:@tobilu/qmd".to_string(),
+                version: "0.1.0".to_string(),
+                source: PackageReceiptSource::Npm {
+                    package_name: "@tobilu/qmd".to_string(),
                 },
             },
         )
@@ -7572,6 +7637,7 @@ outdated: n/a\n"
             installed,
             vec![
                 "deno".to_string(),
+                "npm:@tobilu/qmd".to_string(),
                 "npm:openclaw".to_string(),
                 "pip:psycopg2".to_string()
             ]
@@ -9226,6 +9292,33 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
     }
 
     #[test]
+    fn remove_existing_scoped_npm_install_removes_empty_scope_dir() {
+        let temp = TempDir::new().unwrap();
+        let opt_root = temp.path().join("opt");
+        let bin_dir = temp.path().join("usr-local-bin");
+        let qmd = opt_root.join("npm/@tobilu/qmd");
+
+        fs::create_dir_all(qmd.join("bin")).unwrap();
+        fs::create_dir_all(&bin_dir).unwrap();
+        write_stub_manifest(
+            &qmd.join(STUB_MANIFEST),
+            &StubManifest {
+                stubs: vec!["qmd".to_string()],
+            },
+        )
+        .unwrap();
+
+        write_executable(&qmd.join("bin/qmd"));
+        write_executable(&bin_dir.join("qmd"));
+
+        remove_existing_package_install(&opt_root, "npm:@tobilu/qmd", &bin_dir).unwrap();
+
+        assert!(fs::symlink_metadata(&qmd).is_err());
+        assert!(fs::symlink_metadata(opt_root.join("npm/@tobilu")).is_err());
+        assert!(fs::symlink_metadata(bin_dir.join("qmd")).is_err());
+    }
+
+    #[test]
     fn refresh_post_uninstall_stubs_updates_python_dispatchers() {
         let temp = TempDir::new().unwrap();
         let opt_root = temp.path().join("opt");
@@ -9717,6 +9810,18 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
                 Path::new(TMP_TOOL_ROOT),
             )
         );
+    }
+
+    #[test]
+    fn install_plan_for_i_scoped_npm_preserves_scope_in_opt_root() {
+        let plan = InstallPlan::for_i_npm(
+            "npm:@tobilu/qmd".to_string(),
+            "npm:@tobilu/qmd".to_string(),
+            "@tobilu/qmd",
+        );
+
+        assert_eq!(plan.stable_root, PathBuf::from("/opt/npm/@tobilu/qmd"));
+        assert_eq!(plan.install_root, PathBuf::from("/opt/npm/@tobilu/qmd"));
     }
 
     #[test]
