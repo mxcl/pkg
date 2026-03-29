@@ -73,6 +73,7 @@ const EMBEDDED_NPM_DATA: &str = include_str!("../data/npm.js");
 const EMBEDDED_PIP_DATA: &str = include_str!("../data/pip.json");
 const EMBEDDED_POST_INSTALL_CHECK_SKIP: &str =
     include_str!("../data/post_install_check_skip.jsonc");
+const EMBEDDED_STUB_EXCLUSIONS: &str = include_str!("../data/stub_exclusions.json");
 const BREW_PACKAGE_PREFIX: &str = "brew:";
 const FORMULA_API_ROOT: &str = "https://formulae.brew.sh/api/formula";
 const FORMULA_API_INDEX_URL: &str = "https://formulae.brew.sh/api/formula.json";
@@ -126,6 +127,7 @@ static POST_INSTALL_CHECK_SKIP: OnceLock<HashSet<String>> = OnceLock::new();
 static NPM_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
 static PIP_PACKAGE_DATA: OnceLock<HashMap<String, PackageInstallData>> = OnceLock::new();
 static FORMULA_ALIAS_INDEX: OnceLock<Result<HashMap<String, String>, String>> = OnceLock::new();
+static STUB_EXCLUSIONS: OnceLock<HashMap<String, HashSet<String>>> = OnceLock::new();
 
 fn formula_api_root() -> String {
     env::var("PKG_FORMULA_API_ROOT").unwrap_or_else(|_| FORMULA_API_ROOT.to_string())
@@ -1421,6 +1423,7 @@ fn run_i_npm(config: &Config, package_name: String, npm_package: String) -> Resu
             &plan,
             &dependencies.formula_graph,
             [executable.as_str()],
+            &package_stub_exclusions(&plan.package_name),
             &previous_stubs,
         )?;
         installed_stub_paths(&plan)
@@ -1505,7 +1508,13 @@ fn run_i_pip(config: &Config, package_name: String, pip_package: String) -> Resu
         )?;
         let root_executables =
             load_root_executable_manifest(&plan.root_executables_manifest_path())?.stubs;
-        sync_declared_stubs(&plan, &formula_graph, &root_executables, &previous_stubs)?;
+        sync_declared_stubs(
+            &plan,
+            &formula_graph,
+            &root_executables,
+            &package_stub_exclusions(&plan.package_name),
+            &previous_stubs,
+        )?;
         installed_stub_paths(&plan)
     })();
 
@@ -2024,6 +2033,37 @@ fn embedded_post_install_check_skip() -> &'static HashSet<String> {
             .into_iter()
             .collect()
     })
+}
+
+fn embedded_stub_exclusions() -> &'static HashMap<String, HashSet<String>> {
+    STUB_EXCLUSIONS.get_or_init(|| {
+        serde_json::from_str::<HashMap<String, Vec<String>>>(EMBEDDED_STUB_EXCLUSIONS)
+            .expect("failed to parse embedded stub exclusions JSON")
+            .into_iter()
+            .map(|(package, executables)| (package, executables.into_iter().collect()))
+            .collect()
+    })
+}
+
+fn formula_stub_exclusions(formula: &str) -> HashSet<String> {
+    embedded_stub_exclusions()
+        .get(&format!("{BREW_PACKAGE_PREFIX}{formula}"))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn vendor_stub_exclusions(package: &vendor::VendorPackage) -> HashSet<String> {
+    embedded_stub_exclusions()
+        .get(&format!("vendor:{}", package.name))
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn package_stub_exclusions(package_name: &str) -> HashSet<String> {
+    embedded_stub_exclusions()
+        .get(package_name)
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn embedded_npm_package_data() -> &'static HashMap<String, PackageInstallData> {
@@ -3562,6 +3602,7 @@ fn sync_stubs(
 
     fs::create_dir_all(USR_LOCAL_BIN)
         .map_err(|err| format!("failed to create {}: {err}", USR_LOCAL_BIN))?;
+    let excluded_stubs = formula_stub_exclusions(&plan.root_formula);
     let current = if plan.mode == Mode::I {
         let manifest = load_root_executable_manifest(&plan.root_executables_manifest_path())?;
         if manifest.stubs.is_empty() {
@@ -3575,6 +3616,7 @@ fn sync_stubs(
     } else {
         collect_root_executables(&plan.stable_root)?
     };
+    let current = filter_stub_executables(current, &excluded_stubs);
     for stub in previous_stubs {
         if !current.iter().any(|(name, _)| name == stub) {
             let path = PathBuf::from(USR_LOCAL_BIN).join(&stub);
@@ -3608,6 +3650,7 @@ fn sync_vendor_stubs(
         plan,
         graph,
         package.executables.iter().copied(),
+        &vendor_stub_exclusions(package),
         previous_stubs,
     )
 }
@@ -3616,6 +3659,7 @@ fn sync_declared_stubs<I, S>(
     plan: &InstallPlan,
     graph: &[FormulaSpec],
     executables: I,
+    excluded_stubs: &HashSet<String>,
     previous_stubs: &[String],
 ) -> Result<(), String>
 where
@@ -3628,7 +3672,10 @@ where
 
     fs::create_dir_all(USR_LOCAL_BIN)
         .map_err(|err| format!("failed to create {}: {err}", USR_LOCAL_BIN))?;
-    let current = collect_declared_root_executables(&plan.install_root, executables)?;
+    let current = filter_stub_executables(
+        collect_declared_root_executables(&plan.install_root, executables)?,
+        excluded_stubs,
+    );
     for stub in previous_stubs {
         if !current.iter().any(|(name, _)| name == stub) {
             let path = PathBuf::from(USR_LOCAL_BIN).join(&stub);
@@ -3729,6 +3776,16 @@ fn collect_declared_root_executables(
     }
     execs.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(execs)
+}
+
+fn filter_stub_executables(
+    executables: Vec<(String, PathBuf)>,
+    excluded_stubs: &HashSet<String>,
+) -> Vec<(String, PathBuf)> {
+    executables
+        .into_iter()
+        .filter(|(name, _)| !excluded_stubs.contains(name))
+        .collect()
 }
 
 fn declared_root_executables_exist(
@@ -7559,6 +7616,28 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
         assert_eq!(
             found,
             vec![("bar".to_string(), bar), ("foo".to_string(), foo)]
+        );
+    }
+
+    #[test]
+    fn filter_stub_executables_omits_excluded_names() {
+        let executables = vec![
+            ("bash".to_string(), PathBuf::from("/tmp/bin/bash")),
+            ("bashbug".to_string(), PathBuf::from("/tmp/bin/bashbug")),
+        ];
+        let excluded = HashSet::from(["bashbug".to_string()]);
+
+        assert_eq!(
+            filter_stub_executables(executables, &excluded),
+            vec![("bash".to_string(), PathBuf::from("/tmp/bin/bash"))]
+        );
+    }
+
+    #[test]
+    fn formula_stub_exclusions_load_bashbug() {
+        assert_eq!(
+            formula_stub_exclusions("bash"),
+            HashSet::from(["bashbug".to_string()])
         );
     }
 
