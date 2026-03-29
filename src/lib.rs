@@ -78,6 +78,7 @@ const BREW_PACKAGE_PREFIX: &str = "brew:";
 const FORMULA_API_ROOT: &str = "https://formulae.brew.sh/api/formula";
 const FORMULA_API_INDEX_URL: &str = "https://formulae.brew.sh/api/formula.json";
 const PYPI_ROOT: &str = "https://pypi.org/pypi";
+const PKG_DISPLAY_NAME: &str = env!("CARGO_PKG_NAME");
 const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 const RELOCATABLE_HOMEBREW_PREFIX: &str = "/opt/homebrew";
 const HOMEBREW_PREFIX_PLACEHOLDER: &str = "@@HOMEBREW_PREFIX@@";
@@ -1135,7 +1136,7 @@ fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
     }
 
     if is_version_flag(&first_arg) {
-        println!("{} {}", invocation.name, env!("CARGO_PKG_VERSION"));
+        println!("{PKG_DISPLAY_NAME} {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
 

@@ -32,7 +32,7 @@ fn subs_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
 
     let output = run_subs(&["--version"]);
     assert!(output.status.success());
-    assert!(stdout(&output).contains(&format!("subs {}", pkg_version())));
+    assert!(stdout(&output).contains(&format!("substrate {}", pkg_version())));
 
     let output = run_subs(&["help", "x"]);
     assert!(output.status.success());
