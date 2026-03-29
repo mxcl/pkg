@@ -2080,6 +2080,9 @@ fn versioned_python_stub_exclusions(formula: &str) -> HashSet<String> {
         format!("idle{major}.{minor}"),
         format!("pydoc{major}"),
         format!("pydoc{major}.{minor}"),
+        "wheel".to_string(),
+        format!("wheel{major}"),
+        format!("wheel{major}.{minor}"),
         format!("python{major}-config"),
         format!("python{major}.{minor}-config"),
     ]
@@ -2098,8 +2101,7 @@ fn parse_python_formula_version(formula: &str) -> Option<(u64, u64)> {
 
 fn embedded_npm_package_data() -> &'static HashMap<String, PackageInstallData> {
     NPM_PACKAGE_DATA.get_or_init(|| {
-        serde_json::from_str(EMBEDDED_NPM_DATA)
-            .expect("failed to parse embedded npm package data")
+        serde_json::from_str(EMBEDDED_NPM_DATA).expect("failed to parse embedded npm package data")
     })
 }
 
@@ -7685,6 +7687,9 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
             "pydoc3.12",
             "python3-config",
             "python3.12-config",
+            "wheel",
+            "wheel3",
+            "wheel3.12",
         ] {
             assert!(exclusions.contains(name), "missing exclusion for {name}");
         }
