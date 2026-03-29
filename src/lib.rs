@@ -163,6 +163,14 @@ struct PackageInstallData {
 #[derive(Debug, Deserialize)]
 struct FormulaInfo {
     #[serde(default)]
+    desc: String,
+    #[serde(default)]
+    homepage: String,
+    #[serde(default)]
+    license: Option<String>,
+    #[serde(default)]
+    caveats: String,
+    #[serde(default)]
     versions: FormulaVersions,
     #[serde(default)]
     revision: u32,
@@ -335,6 +343,11 @@ struct PackageStatusRequest {
 }
 
 #[derive(Debug, PartialEq, Eq)]
+struct InfoRequest {
+    package: RequestedPackage,
+}
+
+#[derive(Debug, PartialEq, Eq)]
 enum PackageSelection {
     AllInstalled,
     Requested(Vec<RequestedPackage>),
@@ -380,6 +393,30 @@ struct PackageStatus {
     source: PackageReceiptSource,
     installed_version: String,
     latest_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PackageInfo {
+    package_name: String,
+    install_root: PathBuf,
+    installed: bool,
+    source: Option<PackageReceiptSource>,
+    source_error: Option<String>,
+    installed_version: Option<String>,
+    latest_version: Option<String>,
+    latest_version_error: Option<String>,
+    homebrew_info: Option<HomebrewPackageInfo>,
+    homebrew_info_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HomebrewPackageInfo {
+    formula: String,
+    description: Option<String>,
+    homepage: Option<String>,
+    license: Option<String>,
+    dependencies: Vec<String>,
+    caveats: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1161,6 +1198,20 @@ fn run_list(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String
     Ok(())
 }
 
+fn run_info(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
+    let request = match parse_info_request(invocation, &mut args)? {
+        Some(request) => request,
+        None => return Ok(()),
+    };
+
+    let config = load_config()?;
+    print!(
+        "{}",
+        format_package_info(&resolve_package_info(&config, &request.package)?)
+    );
+    Ok(())
+}
+
 fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
     let Some(first_arg) = args.next() else {
         print_pkg_usage(&invocation.name);
@@ -1191,6 +1242,9 @@ fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
                 }
                 Some(subcommand) if is_list_subcommand(subcommand) => {
                     print_list_usage(&format!("{} {}", invocation.binary_name, subcommand));
+                }
+                Some(subcommand) if is_info_subcommand(subcommand) => {
+                    print_info_usage(&format!("{} {}", invocation.binary_name, subcommand));
                 }
                 Some(subcommand) => match Mode::from_name(subcommand) {
                     Some(mode) => {
@@ -1246,6 +1300,16 @@ fn dispatch_pkg(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), St
     }
     if is_list_subcommand(subcommand) {
         return run_list(
+            &Invocation {
+                binary_name: invocation.binary_name.clone(),
+                name: format!("{} {subcommand}", invocation.binary_name),
+                mode: None,
+            },
+            args,
+        );
+    }
+    if is_info_subcommand(subcommand) {
+        return run_info(
             &Invocation {
                 binary_name: invocation.binary_name.clone(),
                 name: format!("{} {subcommand}", invocation.binary_name),
@@ -1686,6 +1750,13 @@ fn parse_update_request(
     parse_update_request_from_iter(invocation, args)
 }
 
+fn parse_info_request(
+    invocation: &Invocation,
+    args: &mut env::ArgsOs,
+) -> Result<Option<InfoRequest>, String> {
+    parse_info_request_from_iter(invocation, args)
+}
+
 fn parse_package_status_request(
     invocation: &Invocation,
     args: &mut env::ArgsOs,
@@ -1800,6 +1871,36 @@ where
         selection,
         no_self_update,
     }))
+}
+
+fn parse_info_request_from_iter<I>(
+    invocation: &Invocation,
+    mut args: I,
+) -> Result<Option<InfoRequest>, String>
+where
+    I: Iterator<Item = OsString>,
+{
+    let Some(first_arg) = args.next() else {
+        print_info_usage(&invocation.name);
+        return Err("missing package name".to_string());
+    };
+
+    if is_help_flag(&first_arg) {
+        print_info_usage(&invocation.name);
+        return Ok(None);
+    }
+
+    if is_version_flag(&first_arg) {
+        println!("{} {}", invocation.name, env!("CARGO_PKG_VERSION"));
+        return Ok(None);
+    }
+
+    let package = parse_package_name(&first_arg)?;
+    if args.next().is_some() {
+        return Err("supports a single package".to_string());
+    }
+
+    Ok(Some(InfoRequest { package }))
 }
 
 fn parse_package_status_request_from_iter<I>(
@@ -2460,14 +2561,7 @@ fn resolve_package_status_at(
     }
 
     let receipt = load_or_resolve_package_receipt(package_name, &install_root)?;
-    let latest_version = match &receipt.source {
-        PackageReceiptSource::Formula { root_formula } => {
-            resolve_formula_latest_version(config, root_formula)?
-        }
-        PackageReceiptSource::Vendor { vendor_name } => resolve_vendor_latest_version(vendor_name)?,
-        PackageReceiptSource::Npm { package_name } => resolve_npm_latest_version(package_name)?,
-        PackageReceiptSource::Pip { package_name } => resolve_pip_latest_version(package_name)?,
-    };
+    let latest_version = resolve_latest_version_for_source(config, &receipt.source)?;
 
     Ok(PackageStatus {
         package_name: receipt.package_name,
@@ -2501,6 +2595,326 @@ fn requested_package_from_status(status: &PackageStatus) -> RequestedPackage {
         }
         _ => RequestedPackage::Auto(status.package_name.clone()),
     }
+}
+
+fn resolve_package_info(
+    config: &Config,
+    requested: &RequestedPackage,
+) -> Result<PackageInfo, String> {
+    let package_name = requested_package_name(requested);
+    let install_root = package_install_root(Path::new(OPT_PKG_ROOT), &package_name)?;
+    let metadata = match fs::symlink_metadata(&install_root) {
+        Ok(metadata) => Some(metadata),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => return Err(format!("failed to stat {}: {err}", install_root.display())),
+    };
+
+    if let Some(metadata) = metadata {
+        if !metadata.is_dir() {
+            return Err(format!(
+                "installed package root {} is not a directory",
+                install_root.display()
+            ));
+        }
+        return resolve_installed_package_info(config, requested, package_name, install_root);
+    }
+
+    Ok(resolve_uninstalled_package_info(
+        config,
+        requested,
+        package_name,
+        install_root,
+    ))
+}
+
+fn resolve_installed_package_info(
+    config: &Config,
+    requested: &RequestedPackage,
+    package_name: String,
+    install_root: PathBuf,
+) -> Result<PackageInfo, String> {
+    let mut info = PackageInfo {
+        package_name,
+        install_root,
+        installed: true,
+        source: None,
+        source_error: None,
+        installed_version: None,
+        latest_version: None,
+        latest_version_error: None,
+        homebrew_info: None,
+        homebrew_info_error: None,
+    };
+
+    match load_package_receipt(&info.install_root.join(ROOT_RECEIPT)) {
+        Ok(Some(receipt)) => {
+            info.package_name = receipt.package_name;
+            info.source = Some(receipt.source);
+            info.installed_version = Some(receipt.version);
+        }
+        Ok(None) => info.source_error = Some("missing package metadata".to_string()),
+        Err(err) => info.source_error = Some(err),
+    }
+
+    if info.source.is_none() {
+        info.source = explicit_requested_package_source(requested);
+    }
+    populate_package_info_metadata(config, &mut info);
+    Ok(info)
+}
+
+fn resolve_uninstalled_package_info(
+    config: &Config,
+    requested: &RequestedPackage,
+    package_name: String,
+    install_root: PathBuf,
+) -> PackageInfo {
+    let mut info = PackageInfo {
+        package_name,
+        install_root,
+        installed: false,
+        source: None,
+        source_error: None,
+        installed_version: None,
+        latest_version: None,
+        latest_version_error: None,
+        homebrew_info: None,
+        homebrew_info_error: None,
+    };
+
+    match infer_requested_package_source(requested) {
+        Ok(source) => info.source = Some(source),
+        Err(err) => info.source_error = Some(err),
+    }
+    populate_package_info_metadata(config, &mut info);
+    info
+}
+
+fn populate_package_info_metadata(config: &Config, info: &mut PackageInfo) {
+    let Some(source) = info.source.as_ref() else {
+        return;
+    };
+
+    match source {
+        PackageReceiptSource::Formula { root_formula } => match fetch_formula_info(root_formula) {
+            Ok(formula_info) => {
+                info.homebrew_info = Some(homebrew_package_info_from_formula_info(
+                    root_formula,
+                    &formula_info,
+                ));
+                match ensure_formula_has_bottle(root_formula, &formula_info, &config.bottle_tag) {
+                    Ok(()) => info.latest_version = Some(formula_version_string(&formula_info)),
+                    Err(err) => info.latest_version_error = Some(err),
+                }
+            }
+            Err(err) => {
+                info.latest_version_error = Some(err.clone());
+                info.homebrew_info_error = Some(err);
+            }
+        },
+        _ => match resolve_latest_version_for_source(config, source) {
+            Ok(latest_version) => info.latest_version = Some(latest_version),
+            Err(err) => info.latest_version_error = Some(err),
+        },
+    }
+}
+
+fn explicit_requested_package_source(requested: &RequestedPackage) -> Option<PackageReceiptSource> {
+    match requested {
+        RequestedPackage::HomebrewFormula(formula) => Some(PackageReceiptSource::Formula {
+            root_formula: formula.clone(),
+        }),
+        RequestedPackage::Alias { target, .. } => match target {
+            PackageAliasTarget::HomebrewFormula(formula) => Some(PackageReceiptSource::Formula {
+                root_formula: formula.clone(),
+            }),
+            PackageAliasTarget::NpmPackage(package_name) => Some(PackageReceiptSource::Npm {
+                package_name: package_name.clone(),
+            }),
+            PackageAliasTarget::PipPackage(package_name) => Some(PackageReceiptSource::Pip {
+                package_name: package_name.clone(),
+            }),
+        },
+        RequestedPackage::NpmPackage(package_name) => Some(PackageReceiptSource::Npm {
+            package_name: package_name.clone(),
+        }),
+        RequestedPackage::PipPackage(package_name) => Some(PackageReceiptSource::Pip {
+            package_name: package_name.clone(),
+        }),
+        RequestedPackage::Auto(_) => None,
+    }
+}
+
+fn infer_requested_package_source(
+    requested: &RequestedPackage,
+) -> Result<PackageReceiptSource, String> {
+    if let Some(source) = explicit_requested_package_source(requested) {
+        return Ok(source);
+    }
+
+    let RequestedPackage::Auto(package_name) = requested else {
+        unreachable!("qualified and aliased packages are handled above")
+    };
+    if let Some(package) = vendor::get(package_name) {
+        return Ok(PackageReceiptSource::Vendor {
+            vendor_name: package.name.to_string(),
+        });
+    }
+
+    Ok(PackageReceiptSource::Formula {
+        root_formula: resolve_i_root_formula(package_name)?,
+    })
+}
+
+fn resolve_latest_version_for_source(
+    config: &Config,
+    source: &PackageReceiptSource,
+) -> Result<String, String> {
+    match source {
+        PackageReceiptSource::Formula { root_formula } => {
+            resolve_formula_latest_version(config, root_formula)
+        }
+        PackageReceiptSource::Vendor { vendor_name } => resolve_vendor_latest_version(vendor_name),
+        PackageReceiptSource::Npm { package_name } => resolve_npm_latest_version(package_name),
+        PackageReceiptSource::Pip { package_name } => resolve_pip_latest_version(package_name),
+    }
+}
+
+fn homebrew_package_info_from_formula_info(
+    formula: &str,
+    info: &FormulaInfo,
+) -> HomebrewPackageInfo {
+    HomebrewPackageInfo {
+        formula: formula.to_string(),
+        description: string_or_none(&info.desc),
+        homepage: string_or_none(&info.homepage),
+        license: info
+            .license
+            .clone()
+            .and_then(|value| string_or_none(&value)),
+        dependencies: info.dependencies.clone(),
+        caveats: string_or_none(&info.caveats),
+    }
+}
+
+fn string_or_none(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn format_package_info(info: &PackageInfo) -> String {
+    let mut lines = vec![
+        format!("package: {}", info.package_name),
+        format!("install_root: {}", info.install_root.display()),
+        format!("installed: {}", yes_no(info.installed)),
+        format!(
+            "installed_version: {}",
+            format_optional_field(info.installed_version.as_deref(), None)
+        ),
+        format!(
+            "source: {}",
+            format_source_field(info.source.as_ref(), info.source_error.as_deref())
+        ),
+        format!(
+            "latest_version: {}",
+            format_optional_field(
+                info.latest_version.as_deref(),
+                info.latest_version_error.as_deref()
+            )
+        ),
+        format!("outdated: {}", format_outdated_field(info)),
+    ];
+
+    append_homebrew_info_lines(&mut lines, info);
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+fn append_homebrew_info_lines(lines: &mut Vec<String>, info: &PackageInfo) {
+    let Some(homebrew_info) = info.homebrew_info.as_ref() else {
+        if let Some(err) = info.homebrew_info_error.as_deref() {
+            lines.push(format!("homebrew_metadata: unavailable ({err})"));
+        }
+        return;
+    };
+
+    lines.push(format!("homebrew_formula: {}", homebrew_info.formula));
+    lines.push(format!(
+        "description: {}",
+        format_optional_field(homebrew_info.description.as_deref(), None)
+    ));
+    lines.push(format!(
+        "homepage: {}",
+        format_optional_field(homebrew_info.homepage.as_deref(), None)
+    ));
+    lines.push(format!(
+        "license: {}",
+        format_optional_field(homebrew_info.license.as_deref(), None)
+    ));
+    lines.push(format!(
+        "dependencies: {}",
+        format_dependencies(&homebrew_info.dependencies)
+    ));
+    match homebrew_info.caveats.as_deref() {
+        Some(caveats) => {
+            lines.push("caveats:".to_string());
+            for line in caveats.lines() {
+                lines.push(format!("  {}", line));
+            }
+        }
+        None => lines.push("caveats: none".to_string()),
+    }
+}
+
+fn format_source_field(source: Option<&PackageReceiptSource>, err: Option<&str>) -> String {
+    match source {
+        Some(PackageReceiptSource::Formula { root_formula }) => {
+            format!("homebrew formula {root_formula}")
+        }
+        Some(PackageReceiptSource::Vendor { vendor_name }) => {
+            format!("vendor package {vendor_name}")
+        }
+        Some(PackageReceiptSource::Npm { package_name }) => format!("npm package {package_name}"),
+        Some(PackageReceiptSource::Pip { package_name }) => format!("pip package {package_name}"),
+        None => format_optional_field(None, err),
+    }
+}
+
+fn format_outdated_field(info: &PackageInfo) -> &'static str {
+    if !info.installed {
+        return "n/a";
+    }
+
+    match (&info.installed_version, &info.latest_version) {
+        (Some(installed_version), Some(latest_version)) => {
+            yes_no(installed_version != latest_version)
+        }
+        _ => "unknown",
+    }
+}
+
+fn format_optional_field(value: Option<&str>, err: Option<&str>) -> String {
+    match (value, err) {
+        (Some(value), _) => value.to_string(),
+        (None, Some(err)) => format!("unknown ({err})"),
+        (None, None) => "unknown".to_string(),
+    }
+}
+
+fn format_dependencies(dependencies: &[String]) -> String {
+    if dependencies.is_empty() {
+        "none".to_string()
+    } else {
+        dependencies.join(", ")
+    }
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value { "yes" } else { "no" }
 }
 
 #[cfg(not(feature = "gold-release"))]
@@ -4191,12 +4605,19 @@ fn print_list_usage(program: &str) {
     println!("Lists installed packages with their versions.");
 }
 
+fn print_info_usage(program: &str) {
+    println!("Usage: {program} <package|brew:formula|npm:package|pip:package>");
+    println!();
+    println!("Shows package metadata, install status, and update status.");
+}
+
 fn print_pkg_usage(program: &str) {
     println!("Usage: {program} <subcommand> [args...]");
     println!();
     println!("Subcommands:");
     println!("  run, x         Run Homebrew executables ephemerally.");
     println!("  install, i     Install a self-contained package.");
+    println!("  info           Show package metadata and status.");
     println!("  list, ls       List installed packages with their versions.");
     println!("  outdated       List installed packages with updates available.");
     println!("  update, up     Reinstall installed packages with updates available.");
@@ -4244,6 +4665,10 @@ fn is_update_subcommand(value: &str) -> bool {
 
 fn is_list_subcommand(value: &str) -> bool {
     matches!(value, "list" | "ls")
+}
+
+fn is_info_subcommand(value: &str) -> bool {
+    value == "info"
 }
 
 fn parse_formula_spec(value: &OsString) -> Result<Option<String>, String> {
@@ -6140,6 +6565,10 @@ mod tests {
 
     fn formula_info(post_install_defined: bool) -> FormulaInfo {
         FormulaInfo {
+            desc: String::new(),
+            homepage: String::new(),
+            license: None,
+            caveats: String::new(),
             versions: FormulaVersions::default(),
             revision: 0,
             dependencies: Vec::new(),
@@ -6768,6 +7197,42 @@ or `npm:clawhub` for the aliased package"
     }
 
     #[test]
+    fn parse_info_request_accepts_single_package() {
+        let invocation = Invocation {
+            binary_name: "subs".to_string(),
+            name: "subs info".to_string(),
+            mode: None,
+        };
+        let request = parse_info_request_from_iter(
+            &invocation,
+            vec![OsString::from("npm:openclaw")].into_iter(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            request,
+            Some(InfoRequest {
+                package: RequestedPackage::NpmPackage("openclaw".to_string()),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_info_request_rejects_multiple_packages() {
+        let invocation = Invocation {
+            binary_name: "subs".to_string(),
+            name: "subs info".to_string(),
+            mode: None,
+        };
+        let request = parse_info_request_from_iter(
+            &invocation,
+            vec![OsString::from("ffmpeg"), OsString::from("deno")].into_iter(),
+        );
+
+        assert_eq!(request, Err("supports a single package".to_string()));
+    }
+
+    #[test]
     fn ensure_package_installed_reports_missing_package() {
         let temp = TempDir::new().unwrap();
 
@@ -6790,6 +7255,82 @@ or `npm:clawhub` for the aliased package"
                 "/usr/local/bin/npm".to_string(),
             ]),
             "/usr/local/bin/node\n/usr/local/bin/npm"
+        );
+    }
+
+    #[test]
+    fn format_package_info_reports_homebrew_metadata() {
+        let info = PackageInfo {
+            package_name: "ffmpeg".to_string(),
+            install_root: PathBuf::from("/opt/ffmpeg"),
+            installed: true,
+            source: Some(PackageReceiptSource::Formula {
+                root_formula: "ffmpeg".to_string(),
+            }),
+            source_error: None,
+            installed_version: Some("7.1".to_string()),
+            latest_version: Some("7.2".to_string()),
+            latest_version_error: None,
+            homebrew_info: Some(HomebrewPackageInfo {
+                formula: "ffmpeg".to_string(),
+                description: Some("Play, record, convert, and stream audio and video".to_string()),
+                homepage: Some("https://ffmpeg.org/".to_string()),
+                license: Some("GPL-2.0-or-later".to_string()),
+                dependencies: vec!["aom".to_string(), "x264".to_string()],
+                caveats: Some("Enable foo\nThen restart bar".to_string()),
+            }),
+            homebrew_info_error: None,
+        };
+
+        assert_eq!(
+            format_package_info(&info),
+            concat!(
+                "package: ffmpeg\n",
+                "install_root: /opt/ffmpeg\n",
+                "installed: yes\n",
+                "installed_version: 7.1\n",
+                "source: homebrew formula ffmpeg\n",
+                "latest_version: 7.2\n",
+                "outdated: yes\n",
+                "homebrew_formula: ffmpeg\n",
+                "description: Play, record, convert, and stream audio and video\n",
+                "homepage: https://ffmpeg.org/\n",
+                "license: GPL-2.0-or-later\n",
+                "dependencies: aom, x264\n",
+                "caveats:\n",
+                "  Enable foo\n",
+                "  Then restart bar\n",
+            )
+        );
+    }
+
+    #[test]
+    fn format_package_info_reports_unavailable_homebrew_metadata() {
+        let info = PackageInfo {
+            package_name: "foo".to_string(),
+            install_root: PathBuf::from("/opt/foo"),
+            installed: false,
+            source: Some(PackageReceiptSource::Formula {
+                root_formula: "foo".to_string(),
+            }),
+            source_error: None,
+            installed_version: None,
+            latest_version: None,
+            latest_version_error: Some("failed to fetch formula metadata".to_string()),
+            homebrew_info: None,
+            homebrew_info_error: Some("failed to fetch formula metadata".to_string()),
+        };
+
+        assert_eq!(
+            format_package_info(&info),
+            "package: foo\n\
+install_root: /opt/foo\n\
+installed: no\n\
+installed_version: unknown\n\
+source: homebrew formula foo\n\
+latest_version: unknown (failed to fetch formula metadata)\n\
+outdated: n/a\n\
+homebrew_metadata: unavailable (failed to fetch formula metadata)\n"
         );
     }
 
@@ -6853,6 +7394,12 @@ or `npm:clawhub` for the aliased package"
         assert!(is_list_subcommand("list"));
         assert!(is_list_subcommand("ls"));
         assert!(!is_list_subcommand("outdated"));
+    }
+
+    #[test]
+    fn is_info_subcommand_accepts_info_only() {
+        assert!(is_info_subcommand("info"));
+        assert!(!is_info_subcommand("list"));
     }
 
     #[test]
@@ -8926,7 +9473,11 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         assert_eq!(first_plan.stable_root, first_plan.install_root);
         assert!(first_plan.install_root.starts_with(temp.path().join("x")));
         assert_ne!(first_plan.install_root, second_plan.install_root);
-        let workspace_name = first_plan.install_root.file_name().unwrap().to_string_lossy();
+        let workspace_name = first_plan
+            .install_root
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
         assert_eq!(workspace_name.len(), 12);
         assert!(!workspace_name.starts_with('.'));
     }

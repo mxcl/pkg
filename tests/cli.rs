@@ -42,6 +42,10 @@ fn subs_top_level_cli_paths_cover_help_version_and_unknown_subcommands() {
     assert!(output.status.success());
     assert!(stdout(&output).contains("Usage: subs update"));
 
+    let output = run_subs(&["help", "info"]);
+    assert!(output.status.success());
+    assert!(stdout(&output).contains("Usage: subs info"));
+
     let output = run_subs(&["wat"]);
     assert!(!output.status.success());
     assert!(stderr(&output).contains("subs: unknown subcommand 'wat'"));
@@ -52,7 +56,11 @@ fn subs_subcommand_parsing_covers_help_version_and_non_root_failures() {
     let version = pkg_version();
     let cases = [
         (vec!["run", "--help"], true, "Usage: subs run".to_string()),
-        (vec!["run", "--version"], true, format!("subs run {version}")),
+        (
+            vec!["run", "--version"],
+            true,
+            format!("subs run {version}"),
+        ),
         (vec!["x", "--help"], true, "Usage: subs x".to_string()),
         (vec!["x", "--version"], true, format!("subs x {version}")),
         (vec!["i", "--help"], true, "Usage: subs i".to_string()),
@@ -72,6 +80,12 @@ fn subs_subcommand_parsing_covers_help_version_and_non_root_failures() {
             vec!["list", "--version"],
             true,
             format!("subs list {version}"),
+        ),
+        (vec!["info", "--help"], true, "Usage: subs info".to_string()),
+        (
+            vec!["info", "--version"],
+            true,
+            format!("subs info {version}"),
         ),
         (
             vec!["outdated", "--help"],
@@ -111,6 +125,11 @@ fn subs_subcommand_parsing_covers_help_version_and_non_root_failures() {
     assert!(!output.status.success());
     assert!(stdout(&output).contains("Usage: subs run"));
     assert!(stderr(&output).contains("subs: missing executable name"));
+
+    let output = run_subs(&["info"]);
+    assert!(!output.status.success());
+    assert!(stdout(&output).contains("Usage: subs info"));
+    assert!(stderr(&output).contains("subs: missing package name"));
 
     let output = run_subs(&["x", "+ripgrep", "+pcre2", "rg"]);
     assert!(!output.status.success());
