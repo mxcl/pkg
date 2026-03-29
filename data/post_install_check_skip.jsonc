@@ -9,6 +9,8 @@
   "unbound", //TODO https://github.com/Homebrew/homebrew-core/blob/61659a355b44ff685a0338c8ad9fa24e04575155/Formula/u/unbound.rb#L59
   "librsvg", //TODO https://github.com/Homebrew/homebrew-core/blob/b57a52a47643553c66a2965a30f167181e9972c3/Formula/lib/librsvg.rb
   "gdk-pixbuf", //TODO https://github.com/Homebrew/homebrew-core/blob/a5ef1fec008b0d214be193ac59e9ce12a62824bc/Formula/g/gdk-pixbuf.rb#L85
+  "postgresql@18", // seems Homebrew specific
+  "llvm@20", //TODO https://github.com/Homebrew/homebrew-core/blob/e83a5e3748363c2a421ed9756febbb4168c8ef94/Formula/l/llvm.rb#L498
 
   // leave last so we can add trailing commas to new entries above
   "openssl@3"
