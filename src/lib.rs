@@ -7929,20 +7929,20 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert_eq!(
             fs::read_link(bin_dir.join("python")).unwrap(),
-            bin_dir.join("python3")
+            PathBuf::from("python3")
         );
         assert_eq!(
             fs::read_link(bin_dir.join("pip")).unwrap(),
-            bin_dir.join("pip3")
+            PathBuf::from("pip3")
         );
 
         assert_eq!(
             fs::read_link(bin_dir.join("python3")).unwrap(),
-            bin_dir.join("python3.13")
+            PathBuf::from("python3.13")
         );
         assert_eq!(
             fs::read_link(bin_dir.join("pip3")).unwrap(),
-            bin_dir.join("pip3.13")
+            PathBuf::from("pip3.13")
         );
         assert_eq!(
             fs::read_to_string(plan.install_root.join(OPENSSL_CERT_PEM_DESTINATION)).unwrap(),
@@ -8173,20 +8173,20 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert_eq!(
             fs::read_link(bin_dir.join("python")).unwrap(),
-            bin_dir.join("python3")
+            PathBuf::from("python3")
         );
         assert_eq!(
             fs::read_link(bin_dir.join("python3")).unwrap(),
-            bin_dir.join("python3.12")
+            PathBuf::from("python3.12")
         );
 
         assert_eq!(
             fs::read_link(bin_dir.join("pip")).unwrap(),
-            bin_dir.join("pip3")
+            PathBuf::from("pip3")
         );
         assert_eq!(
             fs::read_link(bin_dir.join("pip3")).unwrap(),
-            bin_dir.join("pip3.12")
+            PathBuf::from("pip3.12")
         );
         assert!(fs::symlink_metadata(bin_dir.join("python3.13")).is_err());
         assert!(fs::symlink_metadata(bin_dir.join("pip3.13")).is_err());
@@ -9077,7 +9077,7 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         );
         assert_eq!(
             fs::read_link(bin_dir.join("python3")).unwrap(),
-            bin_dir.join("python3.12")
+            PathBuf::from("python3.12")
         );
 
         let openssl_prefix = temp.path().join("openssl");

@@ -104,11 +104,19 @@ fn write_symlink(path: &Path, target: &Path) -> Result<(), String> {
         Err(err) => return Err(format!("failed to stat {}: {err}", path.display())),
     }
 
-    symlink(target, path).map_err(|err| {
+    let relative_target = target.file_name().ok_or_else(|| {
+        format!(
+            "failed to compute relative target for {} from {}",
+            target.display(),
+            path.display()
+        )
+    })?;
+
+    symlink(relative_target, path).map_err(|err| {
         format!(
             "failed to symlink {} to {}: {err}",
             path.display(),
-            target.display()
+            relative_target.to_string_lossy()
         )
     })
 }
