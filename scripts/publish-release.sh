@@ -76,6 +76,38 @@ print(name.strip())
 PY
 )"
 
+db_path="$PWD/data/db.json"
+db_entry_count="$(
+  python - "$db_path" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        data = json.load(handle)
+except FileNotFoundError:
+    sys.stderr.write(f"error: {path} not found\n")
+    sys.exit(1)
+except json.JSONDecodeError as err:
+    sys.stderr.write(f"error: failed to parse {path}: {err}\n")
+    sys.exit(1)
+
+entries = data.get("entries")
+if not isinstance(entries, dict):
+    sys.stderr.write(f"error: {path} has invalid or missing entries\n")
+    sys.exit(1)
+
+print(len(entries))
+PY
+)"
+
+if [ "$db_entry_count" -eq 0 ]; then
+  echo "error: aborting publish-release because $db_path has zero entries" >&2
+  exit 1
+fi
+
 bin_name="$(
   python - "$cargo_toml" <<'PY'
 import sys
