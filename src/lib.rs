@@ -191,6 +191,11 @@ struct PypiPackageInfo {
 }
 
 #[derive(Debug, Deserialize)]
+struct NpmPackageMetadata {
+    homepage: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct FormulaIndexEntry {
     name: String,
     #[serde(default)]
@@ -410,6 +415,8 @@ struct PackageInfo {
     executable_paths_error: Option<String>,
     homebrew_info: Option<HomebrewPackageInfo>,
     homebrew_info_error: Option<String>,
+    npm_homepage: Option<String>,
+    npm_package_info_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1208,7 +1215,7 @@ fn run_info(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String
 
     let config = load_config()?;
     print!(
-        "{}",
+        "{}\n",
         format_package_info(&resolve_package_info(&config, &request.package)?)
     );
     Ok(())
@@ -2660,6 +2667,8 @@ fn resolve_installed_package_info(
         executable_paths_error: None,
         homebrew_info: None,
         homebrew_info_error: None,
+        npm_homepage: None,
+        npm_package_info_error: None,
     };
 
     match load_package_receipt(&info.install_root.join(ROOT_RECEIPT)) {
@@ -2706,6 +2715,8 @@ fn resolve_uninstalled_package_info(
         executable_paths_error: None,
         homebrew_info: None,
         homebrew_info_error: None,
+        npm_homepage: None,
+        npm_package_info_error: None,
     };
 
     match infer_requested_package_source(requested) {
@@ -2750,6 +2761,16 @@ fn populate_package_info_metadata(config: &Config, info: &mut PackageInfo) {
                 info.homebrew_info_error = Some(err);
             }
         },
+        PackageReceiptSource::Npm { package_name } => {
+            match resolve_latest_version_for_source(config, source) {
+                Ok(latest_version) => info.latest_version = Some(latest_version),
+                Err(err) => info.latest_version_error = Some(err),
+            }
+            match resolve_npm_homepage(package_name) {
+                Ok(homepage) => info.npm_homepage = homepage,
+                Err(err) => info.npm_package_info_error = Some(err),
+            }
+        }
         _ => match resolve_latest_version_for_source(config, source) {
             Ok(latest_version) => info.latest_version = Some(latest_version),
             Err(err) => info.latest_version_error = Some(err),
@@ -2957,6 +2978,17 @@ fn format_package_info(info: &PackageInfo) -> String {
             push_wrapped_field(
                 &mut metadata_lines,
                 "Homebrew Info",
+                &format!("unavailable ({err})"),
+            );
+        }
+    }
+    if let Some(PackageReceiptSource::Npm { .. }) = info.source.as_ref() {
+        if let Some(homepage) = info.npm_homepage.as_deref() {
+            push_wrapped_field(&mut metadata_lines, "Homepage", homepage);
+        } else if let Some(err) = info.npm_package_info_error.as_deref() {
+            push_wrapped_field(
+                &mut metadata_lines,
+                "Homepage",
                 &format!("unavailable ({err})"),
             );
         }
@@ -3490,6 +3522,19 @@ fn resolve_npm_package_version(package_name: &str) -> Result<semver::Version, St
 
 fn resolve_npm_latest_version(package_name: &str) -> Result<String, String> {
     resolve_npm_package_version(package_name).map(|version| version.to_string())
+}
+
+fn resolve_npm_homepage(package_name: &str) -> Result<Option<String>, String> {
+    let url = format!(
+        "{}/{}",
+        std::env::var("PKG_NPM_REGISTRY_ROOT")
+            .unwrap_or_else(|_| "https://registry.npmjs.org".to_string()),
+        urlencoding::encode(package_name)
+    );
+    let response: NpmPackageMetadata = fetch_json(&url, || {
+        format!("failed to fetch npm metadata for {package_name}")
+    })?;
+    Ok(response.homepage.and_then(|value| string_or_none(&value)))
 }
 
 fn resolve_pip_latest_version(package_name: &str) -> Result<String, String> {
@@ -7594,6 +7639,8 @@ or `npm:clawhub` for the aliased package"
                 dependencies: vec!["aom".to_string(), "x264".to_string()],
             }),
             homebrew_info_error: None,
+            npm_homepage: None,
+            npm_package_info_error: None,
         };
 
         let rendered = format_package_info(&info);
@@ -7633,6 +7680,8 @@ or `npm:clawhub` for the aliased package"
             executable_paths_error: None,
             homebrew_info: None,
             homebrew_info_error: Some("failed to fetch formula metadata".to_string()),
+            npm_homepage: None,
+            npm_package_info_error: None,
         };
 
         let rendered = format_package_info(&info);
@@ -7668,6 +7717,8 @@ or `npm:clawhub` for the aliased package"
             executable_paths_error: None,
             homebrew_info: None,
             homebrew_info_error: None,
+            npm_homepage: None,
+            npm_package_info_error: None,
         };
 
         let rendered = format_package_info(&info);
@@ -7676,6 +7727,40 @@ or `npm:clawhub` for the aliased package"
         assert!(rendered.contains("Installed     no"));
         assert!(rendered.contains("Source        Subs"));
         assert!(!rendered.contains("Aliases"));
+        assert!(
+            rendered
+                .lines()
+                .all(|line| line.chars().count() <= INFO_WIDTH)
+        );
+    }
+
+    #[test]
+    fn format_package_info_reports_npm_homepage() {
+        let info = PackageInfo {
+            package_name: "openclaw".to_string(),
+            qualified_name: "npm:openclaw".to_string(),
+            install_root: PathBuf::from("/opt/npm/openclaw"),
+            installed: false,
+            source: Some(PackageReceiptSource::Npm {
+                package_name: "openclaw".to_string(),
+            }),
+            source_error: None,
+            aliases: Vec::new(),
+            aliases_error: None,
+            installed_version: None,
+            latest_version: Some("4.5.6".to_string()),
+            latest_version_error: None,
+            executable_paths: Vec::new(),
+            executable_paths_error: None,
+            homebrew_info: None,
+            homebrew_info_error: None,
+            npm_homepage: Some("https://www.example.com/openclaw".to_string()),
+            npm_package_info_error: None,
+        };
+
+        let rendered = format_package_info(&info);
+        assert!(rendered.contains("📦 npm:openclaw"));
+        assert!(rendered.contains("https://www.example.com/openclaw"));
         assert!(
             rendered
                 .lines()
