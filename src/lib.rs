@@ -301,7 +301,13 @@ struct Invocation {
 struct XRequest {
     tool: String,
     tool_args: Vec<OsString>,
-    root_formula: String,
+    root_package: XRootPackage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum XRootPackage {
+    Formula(String),
+    Vendor(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +327,14 @@ enum RequestedPackage {
     HomebrewFormula(String),
     NpmPackage(String),
     PipPackage(String),
+}
+
+impl XRootPackage {
+    fn name(&self) -> &str {
+        match self {
+            Self::Formula(name) | Self::Vendor(name) => name,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -925,42 +939,134 @@ fn run_x(invocation: &Invocation, mut args: env::ArgsOs) -> Result<(), String> {
     };
 
     let config = load_config()?;
-    let graph = resolve_formula_specs(&[request.root_formula.clone()], &config, false)?;
-    let root_formula = graph
-        .last()
-        .map(|spec| spec.name.clone())
-        .ok_or_else(|| "no formula resolved".to_string())?;
-    let plan = InstallPlan::for_x(root_formula);
+    let plan = InstallPlan::for_x(request.root_package.name().to_string());
     let progress = InstallProgress::new(&plan.package_name);
 
-    let result = (|| {
-        let (staged_plan, run_workspace) = prepare_x_install_plan(&plan)?;
-        ensure_plan_parent_dirs(&staged_plan)?;
-        let downloads = download_bottles(&graph, &staged_plan.tmp_root, Some(&progress))?;
-        progress.begin_install_phase();
-        let installs = inspect_keg_dirs(&graph, &downloads)?;
-        let rewrite_rules = build_rewrite_rules(&staged_plan, &installs);
-        install_package(
-            &config,
-            &staged_plan,
-            &installs,
-            &rewrite_rules,
-            Some(&progress),
-        )?;
-        run_package_post_install(&staged_plan, &installs, Path::new(USR_LOCAL_BIN))?;
+    let result = (|| match &request.root_package {
+        XRootPackage::Formula(root_formula) => {
+            let graph = resolve_formula_specs(std::slice::from_ref(root_formula), &config, false)?;
+            let root_formula = graph
+                .last()
+                .map(|spec| spec.name.clone())
+                .ok_or_else(|| "no formula resolved".to_string())?;
+            let plan = InstallPlan::for_x(root_formula);
+            let (staged_plan, run_workspace) = prepare_x_install_plan(&plan)?;
+            ensure_plan_parent_dirs(&staged_plan)?;
+            let downloads = download_bottles(&graph, &staged_plan.tmp_root, Some(&progress))?;
+            progress.begin_install_phase();
+            let installs = inspect_keg_dirs(&graph, &downloads)?;
+            let rewrite_rules = build_rewrite_rules(&staged_plan, &installs);
+            install_package(
+                &config,
+                &staged_plan,
+                &installs,
+                &rewrite_rules,
+                Some(&progress),
+            )?;
+            run_package_post_install(&staged_plan, &installs, Path::new(USR_LOCAL_BIN))?;
 
-        let exec_path = find_executable_in_package(&staged_plan, &graph, &request.tool)
+            let exec_path = find_executable_in_package(&staged_plan, &graph, &request.tool)
+                .ok_or_else(|| {
+                    format!(
+                        "'{}' not found in package {}",
+                        request.tool, staged_plan.package_name
+                    )
+                })?;
+            Ok((
+                exec_path,
+                build_exec_path_entries(&staged_plan, &graph),
+                run_workspace,
+            ))
+        }
+        XRootPackage::Vendor(package_name) => {
+            let package = vendor::get(package_name)
+                .ok_or_else(|| format!("vendor package {package_name} is not registered"))?;
+            let (staged_plan, run_workspace) = prepare_x_install_plan(&plan)?;
+            let version = (package.version)()?;
+            let vendor_install = VendorInstall { package, version };
+            let dependencies = resolve_vendor_dependency_specs(
+                vendor_install.package.dependencies,
+                &config,
+                false,
+            )?;
+            let dependency_state = resolve_dependency_install_state(
+                &dependencies.formula_graph,
+                &staged_plan.tmp_root,
+                Some(&progress),
+            )?;
+            ensure_plan_parent_dirs(&staged_plan)?;
+
+            let dependency_current = dependencies_are_current(
+                &staged_plan,
+                &dependency_state.installs,
+                &dependencies.vendor_installs,
+                &config,
+            )?;
+            let mut dependencies_reinstalled = false;
+            if !dependency_current {
+                progress.begin_install_phase();
+                install_dependency_formulas(
+                    &config,
+                    &staged_plan,
+                    &dependency_state.installs,
+                    Some(&progress),
+                )?;
+                install_vendor_dependencies(
+                    &staged_plan,
+                    &dependencies.formula_graph,
+                    &dependencies.vendor_installs,
+                    Some(&progress),
+                )?;
+                dependencies_reinstalled = true;
+            }
+
+            if !vendor_root_is_current(
+                &staged_plan,
+                &vendor_install,
+                &dependency_state.installs,
+                &config.bottle_tag,
+            )? {
+                if !dependencies_reinstalled {
+                    if dependencies.formula_graph.is_empty()
+                        && dependencies.vendor_installs.is_empty()
+                    {
+                        prepare_vendor_root_area(&staged_plan)?;
+                    } else {
+                        reinstall_vendor_dependency_tree(
+                            &config,
+                            &staged_plan,
+                            &dependency_state.installs,
+                            &dependencies.formula_graph,
+                            &dependencies.vendor_installs,
+                            Some(&progress),
+                        )?;
+                    }
+                }
+                install_vendor_root(
+                    &staged_plan,
+                    &dependencies.formula_graph,
+                    &vendor_install,
+                    Some(&progress),
+                )?;
+            }
+
+            let exec_path = find_executable_in_package(
+                &staged_plan,
+                &dependencies.formula_graph,
+                &request.tool,
+            )
             .ok_or_else(|| {
                 format!(
                     "'{}' not found in package {}",
                     request.tool, staged_plan.package_name
                 )
             })?;
-        Ok((
-            exec_path,
-            build_exec_path_entries(&staged_plan, &graph),
-            run_workspace,
-        ))
+            Ok((
+                exec_path,
+                build_exec_path_entries(&staged_plan, &dependencies.formula_graph),
+                run_workspace,
+            ))
+        }
     })();
 
     match result {
@@ -1718,23 +1824,26 @@ where
     }
     let tool_args: Vec<OsString> = args.collect();
 
-    let root_formula = if let Some(formula) = formulas.pop() {
-        formula
+    let root_package = if let Some(formula) = formulas.pop() {
+        XRootPackage::Formula(preferred_run_formula(formula))
     } else if let Some((base_tool, formula)) = split_versioned_tool_token(&tool) {
         tool = base_tool;
-        formula
+        XRootPackage::Formula(preferred_run_formula(formula))
+    } else if let Some(package) = vendor_package_for_tool(&tool) {
+        XRootPackage::Vendor(package.name.to_string())
     } else {
-        db.entries
-            .get(&tool)
-            .cloned()
-            .ok_or_else(|| format!("no Homebrew formula found for '{tool}'"))?
+        XRootPackage::Formula(preferred_run_formula(
+            db.entries
+                .get(&tool)
+                .cloned()
+                .ok_or_else(|| format!("no Homebrew formula found for '{tool}'"))?,
+        ))
     };
-    let root_formula = preferred_run_formula(root_formula);
 
     Ok(Some(XRequest {
         tool,
         tool_args,
-        root_formula,
+        root_package,
     }))
 }
 
@@ -2256,6 +2365,14 @@ fn preferred_run_formula(formula: String) -> String {
     recommended_full_formula(&formula)
         .map(str::to_string)
         .unwrap_or(formula)
+}
+
+fn vendor_package_for_tool(tool: &str) -> Option<vendor::VendorPackage> {
+    vendor::PACKAGES
+        .iter()
+        .copied()
+        .find(|entry| (entry.executables)().contains(&tool))
+        .map(vendor::VendorEntry::package)
 }
 
 fn print_full_formula_recommendation(formula: &str) -> Result<(), String> {
@@ -10230,7 +10347,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         .unwrap()
         .unwrap();
         assert_eq!(request.tool, "python");
-        assert_eq!(request.root_formula, "python@3.12");
+        assert_eq!(
+            request.root_package,
+            XRootPackage::Formula("python@3.12".to_string())
+        );
         assert_eq!(request.tool_args, vec![OsString::from("--flag")]);
     }
 
@@ -10246,7 +10366,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         )
         .unwrap()
         .unwrap();
-        assert_eq!(ffmpeg.root_formula, "ffmpeg-full");
+        assert_eq!(
+            ffmpeg.root_package,
+            XRootPackage::Formula("ffmpeg-full".to_string())
+        );
 
         let magick = parse_x_request_from_iter_with_db(
             &invocation,
@@ -10255,7 +10378,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         )
         .unwrap()
         .unwrap();
-        assert_eq!(magick.root_formula, "imagemagick-full");
+        assert_eq!(
+            magick.root_package,
+            XRootPackage::Formula("imagemagick-full".to_string())
+        );
 
         let explicit = parse_x_request_from_iter_with_db(
             &invocation,
@@ -10264,7 +10390,34 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         )
         .unwrap()
         .unwrap();
-        assert_eq!(explicit.root_formula, "imagemagick-full");
+        assert_eq!(
+            explicit.root_package,
+            XRootPackage::Formula("imagemagick-full".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_x_request_prefers_vendor_packages_before_homebrew_lookup() {
+        let invocation = Invocation::for_subcommand("subs", "x", Mode::X);
+        let db = test_db(&[("npx", "node"), ("gh", "gh")]);
+
+        let npx = parse_x_request_from_iter_with_db(
+            &invocation,
+            vec![OsString::from("npx"), OsString::from("cowsay")].into_iter(),
+            &db,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(npx.root_package, XRootPackage::Vendor("node".to_string()));
+
+        let gh = parse_x_request_from_iter_with_db(
+            &invocation,
+            vec![OsString::from("gh"), OsString::from("--version")].into_iter(),
+            &db,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(gh.root_package, XRootPackage::Vendor("gh".to_string()));
     }
 
     #[test]
@@ -10283,7 +10436,10 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         .unwrap()
         .unwrap();
         assert_eq!(explicit.tool, "rg");
-        assert_eq!(explicit.root_formula, "ripgrep");
+        assert_eq!(
+            explicit.root_package,
+            XRootPackage::Formula("ripgrep".to_string())
+        );
         assert_eq!(explicit.tool_args, vec![OsString::from("--version")]);
 
         assert_eq!(
