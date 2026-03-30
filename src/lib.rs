@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
-use tempfile::{Builder, TempDir};
+use tempfile::TempDir;
 use ureq::Error as UreqError;
 use walkdir::WalkDir;
 
@@ -627,7 +627,7 @@ impl InstallPlan {
         if self.mode == Mode::I || formula == self.root_formula {
             self.install_root.clone()
         } else {
-            self.install_root.join("pkgs").join(formula)
+            self.install_root.clone()
         }
     }
 
@@ -635,17 +635,15 @@ impl InstallPlan {
         if self.mode == Mode::I || formula == self.root_formula {
             self.stable_root.clone()
         } else {
-            self.stable_root.join("pkgs").join(formula)
+            self.stable_root.clone()
         }
     }
 
     fn receipt_path(&self, formula: &str) -> PathBuf {
-        if self.mode == Mode::I {
+        if self.mode == Mode::I || self.mode == Mode::X {
             self.install_root
                 .join(RECEIPTS_DIR)
                 .join(format!("{formula}.json"))
-        } else if formula == self.root_formula {
-            self.install_root.join(ROOT_RECEIPT)
         } else {
             self.actual_target_dir(formula).join(RECEIPT)
         }
@@ -722,22 +720,13 @@ fn prepare_i_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, Option<Tem
 
 fn prepare_x_install_plan(plan: &InstallPlan) -> Result<(InstallPlan, TempDir), String> {
     debug_assert_eq!(plan.mode, Mode::X);
-    let run_root = plan
-        .stable_root
-        .parent()
-        .ok_or_else(|| format!("invalid stable root {}", plan.stable_root.display()))?;
-    fs::create_dir_all(run_root)
-        .map_err(|err| format!("failed to create {}: {err}", run_root.display()))?;
     fs::create_dir_all(&plan.tmp_root)
         .map_err(|err| format!("failed to create {}: {err}", plan.tmp_root.display()))?;
-    let workspace = Builder::new()
-        .prefix("")
-        .rand_bytes(12)
-        .tempdir_in(run_root)
+    let workspace = TempDir::new_in(&plan.tmp_root)
         .map_err(|err| {
             format!(
                 "failed to create run workspace in {}: {err}",
-                run_root.display()
+                plan.tmp_root.display()
             )
         })?;
     let install_root = workspace.path().to_path_buf();
@@ -8602,7 +8591,7 @@ long_prefix = re.compile(r'/opt/python@3.12/[0-9\\._abrc]+')\n"
 
         assert_eq!(
             fs::read_link(&link).unwrap(),
-            PathBuf::from("../../pkgs/python@3.13/bin/python3.13")
+            PathBuf::from("../../bin/python3.13")
         );
     }
 
@@ -10069,15 +10058,15 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
 
         assert_ne!(first_plan.stable_root, plan.stable_root);
         assert_eq!(first_plan.stable_root, first_plan.install_root);
-        assert!(first_plan.install_root.starts_with(temp.path().join("x")));
+        assert!(first_plan.install_root.starts_with(&plan.tmp_root));
         assert_ne!(first_plan.install_root, second_plan.install_root);
         let workspace_name = first_plan
             .install_root
             .file_name()
             .unwrap()
             .to_string_lossy();
-        assert_eq!(workspace_name.len(), 12);
-        assert!(!workspace_name.starts_with('.'));
+        assert!(workspace_name.starts_with(".tmp"));
+        assert!(workspace_name.len() > 4);
     }
 
     #[test]
@@ -10237,22 +10226,13 @@ info: requested `imagemagick`; `brew:imagemagick-full` is recommended instead\n"
         let plan = InstallPlan::for_x("rg".to_string());
 
         assert_eq!(plan.actual_target_dir("rg"), PathBuf::from("/tmp/x/rg"));
-        assert_eq!(
-            plan.actual_target_dir("pcre2"),
-            PathBuf::from("/tmp/x/rg/pkgs/pcre2")
-        );
+        assert_eq!(plan.actual_target_dir("pcre2"), PathBuf::from("/tmp/x/rg"));
         assert_eq!(plan.stable_target_dir("rg"), PathBuf::from("/tmp/x/rg"));
-        assert_eq!(
-            plan.stable_target_dir("pcre2"),
-            PathBuf::from("/tmp/x/rg/pkgs/pcre2")
-        );
-        assert_eq!(
-            plan.receipt_path("rg"),
-            PathBuf::from("/tmp/x/rg/.pkg/root-receipt.json")
-        );
+        assert_eq!(plan.stable_target_dir("pcre2"), PathBuf::from("/tmp/x/rg"));
+        assert_eq!(plan.receipt_path("rg"), PathBuf::from("/tmp/x/rg/.pkg/receipts/rg.json"));
         assert_eq!(
             plan.receipt_path("pcre2"),
-            PathBuf::from("/tmp/x/rg/pkgs/pcre2/.pkg/receipt.json")
+            PathBuf::from("/tmp/x/rg/.pkg/receipts/pcre2.json")
         );
         assert_eq!(
             plan.package_manifest_path(),
