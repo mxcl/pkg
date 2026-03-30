@@ -2,12 +2,12 @@
 
 [![Coverage Status](https://coveralls.io/repos/github/mxcl/substrate/badge.svg?branch=main)](https://coveralls.io/github/mxcl/substrate?branch=main)
 
-Execution, performance and security oriented (universal) package manager for
-macOS with a special focus on agentic use cases.
+Execution, performance and security oriented multi-source package manager for
+macOS.
 
 ## Install
 
-Substrate is a single binary with no dependencies.
+Substrate is a single rust binary with no dependencies.
 
 ```sh
 gh release download --repo mxcl/substrate --pattern 'substrate*.tar.gz'
@@ -20,40 +20,84 @@ Here’s a one-liner via [`yoink`](https://github.com/mxcl/yoink):
 sh <(curl -fsSL https://yoink.sh) --stream mxcl/substrate | sudo tar -xzC /usr/local/bin
 ```
 
-## Overview
+## Usage Overview
 
-- Installs as root (like the good ol’ days)
-- Installs Homebrew and vendor packages to `/opt/$PKGNAME`
-- Installs npm and pip packages to `/opt/$ECOSYSTEM/$PKGNAME`
-- Understands what brew deps certain npm and pip packages need
-- Installs from vendor when possible
-- Installs Homebrew packages otherwise
-- Never touches `/opt/homebrew`
-- Dependencies of Homebrew packages are installed alongside, ie. a self
-  contained sandbox
-- Installs as little as possible to `/usr/local/bin` (no deps)
-- `subs run PKG` can run anything ephemerally (downloads fresh every time)
-- Agent focused, eg. we package `qmd` and support npm installs like
-  `npm:openclaw`
+```sh
+$ sudo subs install node  # alias: i
+/usr/local/bin/node
+## ^^ installs homebrew packages
 
-## Usage
+$ sudo subs i npm:openclaw
+/usr/local/bin/openclaw
+## ^^ installs npm packages
+
+$ sudo subs i npm:@tobilu/qmd
+◇ installing brew:sqlite dependency…
+/usr/local/bin/qmd
+## ^^ knows when npm packages need homebrew dependencies
+
+$ sudo subs i pip:psycopg2
+◇ installing brew:libpg dependency…
+/usr/local/bin/psycopg2
+## ^^ same for pypi. virtual environment and everything
+
+$ sudo subs i bun
+/usr/local/bin/bun
+## ^^ bun is not in homebrew, but the vendor provides a package and we
+##    know how to check there when brew doesn't have it.
+```
+
+Packages are installed as root with all dependencies side-by-side in
+`/opt/PKGNAME`. Self-contained, isolated and reliable. Also it’s fast.
+
+We also can run anything:
 
 ```sh
 $ subs run zopflipng in.png out.png  # alias: x
-## ^^ emphermeral; downloads fresh every time
+## ^^ run anything ephemerally; downloads fresh every time to an unpredictable location
 
-$ sudo subs install npm:openclaw
-/usr/local/bin/openclaw
-# ^^ humans don’t let Claws modify themselves
-
-$ sudo subs uninstall npm:openclaw  # alias: rm
-
-$ subs list  # alias: ls
-
-$ subs outdated
-
-$ sudo subs update  # alias: up
+$ subs run npx cowsay hello
+ _______
+< hello >
+ -------
+        \   ^__^
+         \  (oo)\_______
+            (__)\       )\/\
+                ||----w |
+                ||     ||
 ```
+
+## Overview
+
+- Securely installs packages as root.
+- Sources from multiple package managers and vendor provided packages.
+- Can mix package managers when eg. npm packages need brew or vendor provided
+  dependencies.
+- Never touches /opt/homebrew.
+- Dependencies are installed alongside; everything goes in the same
+  self-contained prefix at `/opt/PKGNAME`.
+- Installs as little as possible to /usr/local (ie. nothing from deps, only
+  what you asked for, no jank).
+- `subs run PKG` can run anything ephemerally (downloads fresh every time)
+
+### Designed for the Era of Agents
+
+I know what you’re thinking: this douchebag made Homebrew sudo-less and now
+he’s making a new package manager that’s not only sudo but also has a name
+that sounds like it should be a JavaScript library.
+
+When I made Homebrew sudo-less, computers were pretty much single user and the
+users were pretty much human. That’s not the case anymore. We are running
+agents all over the place.
+
+> Don’t let OpenClaw modify itself.
+
+This is also why `subs run` is ephemeral and *always* downloads the latest
+version. The download destination is unpredictable. The window for
+expliotation is small but not zero. We want agents to be able to run anything
+but we don’t want them to to potentially modify binaries as they are
+downloading for who knows what nefarious reason. Then once an agent (or you)
+has used this user-writable software it vanishes.
 
 ## Is This Ready For Me?
 
@@ -67,32 +111,10 @@ that?
 
 ## Caveats
 
-- `subs run` is ephemeral. It always downloads and it always downloads the
-  latest version unless you specify, eg. `subs run zopflipng@1.0.3 …`
-  > This is a feature. We are operating in an agentic world where agents
-  > can literally modify binaries if they want to be malicious. Everything
-  > must be installed by a human and if not then the tool that is installed
-  > by root that is executing things should never trust a user-writable cache
-- there is no `subs services` command. Use `brew`.
-- some Homebrew formulae are not supported. If you come across them, report
+- There is no `subs services` command. Use `brew`.
+- Some Homebrew formulae are not supported. If you come across them, report
   this as a bug.
-- We do not and will likely never support casks.
-
-## Why Did You Do This?
-
-- I made Homebrew sudo-less since I assumed devs were the only users of their
-  computers. Which was a safe bet at the time.
-- Nowadays we are running agents all over the place. Our users contain other
-  entities that are not even human. Best we secure things better now.
-- However, I want agents to be able to run anythiing they need without it
-  messing with the rest of the system.
-- Hence `subs run` executes in a sandbox that can only be configured by the
-  root user. If you run it without configuring it first it can only write to
-  `/tmp`
-- I trust Vendors *the most* to maintain their own packages.
-  - Because their reputation is on the line if they mess it up.
-  - Because they know how to package their own software the best.
-- Packaging is an awful job and I don’t miss it so we don’t do any of it.
+- We do not and will likely never support casks (use `brew`!)
 
 ## Technical Details
 
